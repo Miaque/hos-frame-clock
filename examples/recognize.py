@@ -1,4 +1,4 @@
-"""Run with: uv run python examples/recognize.py frame.jpg"""
+"""运行方式：uv run python examples/recognize.py frame.jpg。"""
 
 import argparse
 import asyncio

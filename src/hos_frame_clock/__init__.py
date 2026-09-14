@@ -1,4 +1,4 @@
-"""Single-camera frame timestamp recognition through AI Studio PP-OCRv6."""
+"""通过 AI Studio PP-OCRv6 识别单路摄像头画面的日期时间。"""
 
 import asyncio
 from dataclasses import dataclass
@@ -16,6 +16,7 @@ from . import config
 
 __all__ = ["FrameTime", "OCRServiceError", "recognize_frame"]
 
+
 _JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 _TIME = re.compile(
     r"(?<![0-9A-Za-z])([0-9]{4})\s*-\s*([0-9]{2})\s*-\s*([0-9]{2})"
@@ -25,20 +26,20 @@ _TIME = re.compile(
 
 @dataclass(frozen=True)
 class FrameTime:
-    """A timezone-naive displayed time and the original matching OCR text."""
+    """不含时区的画面时间及匹配的 OCR 原文。"""
 
     timestamp: datetime
     raw_text: str
 
 
 class OCRServiceError(RuntimeError):
-    """OCR request, remote job or response contract failure."""
+    """OCR 请求失败、远端任务失败或响应不符合契约。"""
 
 
 def _crop(image_bytes: bytes) -> bytes:
     with Image.open(BytesIO(image_bytes)) as image:
         if image.format not in {"JPEG", "PNG"}:
-            raise ValueError("Only JPEG and PNG images are supported")
+            raise ValueError("仅支持 JPEG 和 PNG 图片")
         width, height = image.size
         box = (width * 80 // 100, 0, (width * 98 + 99) // 100,
                (height * 12 + 99) // 100)
@@ -52,7 +53,7 @@ def _parse_result(content: str) -> FrameTime | None:
     matches: dict[datetime, str] = {}
     lines = [line for line in content.splitlines() if line.strip()]
     if not lines:
-        raise OCRServiceError("Empty OCR result document")
+        raise OCRServiceError("OCR 结果文档为空")
     try:
         for line in lines:
             results = json.loads(line)["result"]["ocrResults"]
@@ -69,7 +70,7 @@ def _parse_result(content: str) -> FrameTime | None:
                         continue
                     matches.setdefault(timestamp, match.group())
     except (KeyError, TypeError, ValueError) as exc:
-        raise OCRServiceError("Invalid OCR result document") from exc
+        raise OCRServiceError("OCR 结果文档格式无效") from exc
     if len(matches) == 1:
         timestamp, raw_text = next(iter(matches.items()))
         return FrameTime(timestamp, raw_text)
@@ -83,7 +84,7 @@ def _job_data(response: httpx.Response) -> dict:
             raise TypeError
         return data
     except (KeyError, TypeError, ValueError) as exc:
-        raise OCRServiceError("Invalid OCR job response") from exc
+        raise OCRServiceError("OCR 任务响应格式无效") from exc
 
 
 async def recognize_frame(
@@ -93,21 +94,21 @@ async def recognize_frame(
     timeout: float = 10.0,
     job_url: str = _JOB_URL,
 ) -> FrameTime | None:
-    """Recognize the fixed top-right ROI of one JPEG/PNG frame.
+    """识别单帧 JPEG/PNG 图片右上角固定区域的日期时间。
 
-    ``timeout`` covers image preparation, submission, polling and retrieval.
-    Raises ``TimeoutError`` on expiry, ``OCRServiceError`` on service failures,
-    and input validation or Pillow errors for invalid images.
-    Cancellation propagates. Credentials are sent only to the jobs endpoint.
+    ``timeout`` 覆盖图片准备、任务提交、轮询和结果获取。
+    超时抛出 ``TimeoutError``，服务失败抛出 ``OCRServiceError``，
+    无效图片抛出参数校验异常或 Pillow 异常。
+    调用方取消继续向上传播。凭据仅发送到任务端点。
     """
     if not isinstance(image_bytes, bytes) or not image_bytes:
-        raise ValueError("image_bytes must be non-empty JPEG/PNG bytes")
+        raise ValueError("image_bytes 必须为非空的 JPEG/PNG 编码字节")
     if token is None:
         token = config.settings.token
     if not isinstance(token, str) or not token.strip():
-        raise ValueError("Set PADDLEOCR_TOKEN in .env or environment, or pass a non-empty token")
+        raise ValueError("请在导入前通过 .env 或环境变量设置 PADDLEOCR_TOKEN，或传入非空 token")
     if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout must be positive and finite")
+        raise ValueError("timeout 必须为有限正数")
     headers = {"Authorization": f"bearer {token}"}
     try:
         async with asyncio.timeout(timeout):
@@ -129,7 +130,7 @@ async def recognize_frame(
                 response.raise_for_status()
                 job_id = _job_data(response).get("jobId")
                 if not isinstance(job_id, str) or not job_id:
-                    raise OCRServiceError("Missing OCR job ID")
+                    raise OCRServiceError("缺少 OCR 任务 ID")
                 while True:
                     response = await client.get(
                         f"{job_url.rstrip('/')}/{quote(job_id, safe='')}", headers=headers
@@ -141,16 +142,16 @@ async def recognize_frame(
                         result_url = data.get("resultUrl")
                         url = result_url.get("jsonUrl") if isinstance(result_url, dict) else None
                         if not isinstance(url, str) or not url.startswith("https://"):
-                            raise OCRServiceError("Missing or invalid OCR result URL")
+                            raise OCRServiceError("OCR 结果 URL 缺失或无效")
                         response = await client.get(url, follow_redirects=True)
                         response.raise_for_status()
                         return await asyncio.to_thread(_parse_result, response.text)
                     if state == "failed":
-                        raise OCRServiceError("OCR job failed")
+                        raise OCRServiceError("OCR 任务失败")
                     if state not in ("pending", "running"):
-                        raise OCRServiceError("Unknown OCR job state")
+                        raise OCRServiceError("未知的 OCR 任务状态")
                     await asyncio.sleep(0.5)
     except httpx.TimeoutException as exc:
-        raise TimeoutError("OCR recognition timed out") from exc
+        raise TimeoutError("OCR 识别超时") from exc
     except httpx.HTTPError as exc:
-        raise OCRServiceError("OCR HTTP request failed") from exc
+        raise OCRServiceError("OCR HTTP 请求失败") from exc

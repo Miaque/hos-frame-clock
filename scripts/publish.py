@@ -1,4 +1,4 @@
-"""Build and publish to Nexus with the current user's Maven nexus server."""
+"""使用当前用户 Maven 中的 nexus 服务配置构建并发布到 Nexus。"""
 
 import os
 from pathlib import Path
@@ -24,7 +24,7 @@ def main():
         if not value or value.startswith(("{", "${")):
             raise SystemExit(f"Maven nexus {field} 需要可直接使用的配置值")
         env[variable] = value
-    # Basic authentication must not be overridden by a shell's PyPI API token.
+    # 避免终端环境中的 PyPI API Token 覆盖基本认证凭据。
     env.pop("UV_PUBLISH_TOKEN", None)
     with (project / "pyproject.toml").open("rb") as file:
         version = tomllib.load(file)["project"]["version"]
