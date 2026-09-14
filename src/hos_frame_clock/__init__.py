@@ -6,13 +6,13 @@ from datetime import datetime
 from io import BytesIO
 import json
 import math
-import os
 import re
 from urllib.parse import quote
 
 import httpx
-from dotenv import dotenv_values, find_dotenv
 from PIL import Image
+
+from . import config
 
 __all__ = ["FrameTime", "OCRServiceError", "recognize_frame"]
 
@@ -103,10 +103,7 @@ async def recognize_frame(
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise ValueError("image_bytes must be non-empty JPEG/PNG bytes")
     if token is None:
-        token = os.environ.get("PADDLEOCR_TOKEN")
-        if token is None:
-            env_file = find_dotenv(usecwd=True)
-            token = dotenv_values(env_file, encoding="utf-8-sig").get("PADDLEOCR_TOKEN") if env_file else None
+        token = config.settings.token
     if not isinstance(token, str) or not token.strip():
         raise ValueError("Set PADDLEOCR_TOKEN in .env or environment, or pass a non-empty token")
     if not math.isfinite(timeout) or timeout <= 0:

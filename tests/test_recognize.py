@@ -5,6 +5,7 @@ from email.policy import default
 from functools import partial
 from io import BytesIO
 import json
+from importlib import reload
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,7 @@ import httpx
 from PIL import Image
 
 from hos_frame_clock import OCRServiceError, recognize_frame
+from hos_frame_clock import config
 
 
 def frame_bytes():
@@ -29,13 +31,18 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
     async def test_automatic_token_lookup_and_precedence(self):
         with TemporaryDirectory() as directory:
             previous = Path.cwd()
+            original_settings = config.settings
             project = Path(directory)
             (project / '.env').write_text('PADDLEOCR_TOKEN="file-token"\n', encoding='utf-8')
             (project / 'child').mkdir()
+            (project / 'child' / '.env').write_text(
+                'PADDLEOCR_TOKEN="local-token"\nOTHER_APP_SETTING=value\n',
+                encoding='utf-8',
+            )
             try:
                 os.chdir(project / 'child')
                 for environment, explicit, expected in (
-                    ({}, {}, 'file-token'),
+                    ({}, {}, 'local-token'),
                     ({'PADDLEOCR_TOKEN': 'env-token'}, {}, 'env-token'),
                     ({'PADDLEOCR_TOKEN': 'env-token'}, {'token': 'explicit-token'}, 'explicit-token'),
                 ):
@@ -44,14 +51,41 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                         return httpx.Response(401)
                     client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
                     with patch.dict(os.environ, environment, clear=True), patch('httpx.AsyncClient', client):
+                        reload(config)
                         with self.assertRaises(OCRServiceError):
                             await recognize_frame(frame_bytes(), **explicit)
                         self.assertEqual(dict(os.environ), environment)
-                (project / '.env').write_text('PADDLEOCR_TOKEN=\n', encoding='utf-8')
-                with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
-                    await recognize_frame(frame_bytes())
+                for environment, explicit in (
+                    ({'PADDLEOCR_TOKEN': ''}, {}),
+                    ({'PADDLEOCR_TOKEN': 'env-token'}, {'token': ''}),
+                ):
+                    with patch.dict(os.environ, environment, clear=True), self.assertRaises(ValueError):
+                        reload(config)
+                        await recognize_frame(frame_bytes(), **explicit)
+                (project / 'child' / '.env').unlink()
+                with patch.dict(os.environ, {}, clear=True):
+                    reload(config)
+                    self.assertIsNone(config.settings.token)
+                for content in ('PADDLEOCR_TOKEN=\n', 'PADDLEOCR_TOKEN\n', 'OTHER_APP_SETTING=value\n'):
+                    (project / 'child' / '.env').write_text(content, encoding='utf-8')
+                    with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+                        reload(config)
+                        await recognize_frame(frame_bytes())
             finally:
                 os.chdir(previous)
+                config.settings = original_settings
+
+    async def test_configuration_is_loaded_once(self):
+        with patch.object(config, 'settings', config.Settings(PADDLEOCR_TOKEN='initial-token')):
+            async def handler(request):
+                self.assertEqual(request.headers['Authorization'], 'bearer initial-token')
+                return httpx.Response(401)
+
+            client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
+            with patch.dict(os.environ, {'PADDLEOCR_TOKEN': 'changed-token'}), patch('httpx.AsyncClient', client):
+                for _ in range(2):
+                    with self.assertRaises(OCRServiceError):
+                        await recognize_frame(frame_bytes())
 
     async def test_crops_uploads_and_returns_datetime_and_original_text(self):
         async def handler(request):

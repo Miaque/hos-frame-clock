@@ -34,7 +34,7 @@ async def main():
 asyncio.run(main())
 ```
 
-运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。Token 优先级为显式 `token` 参数、进程环境变量、从当前工作目录向父目录查找到的最近 `.env`。仅读取配置，不修改进程环境变量；不写文件、不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
+运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。环境配置使用 `pydantic-settings` 的全局实例管理，在首次导入库时加载一次；请在导入前设置环境变量并确定工作目录，后续环境变量或 `.env` 修改需重启进程生效。Token 优先级为显式 `token` 参数、进程环境变量、当前工作目录的 `.env`。使用 UTF-8 编码，忽略 `.env` 中其他应用的配置项；已有空 Token 会报错，不向低优先级配置回退。仅读取配置，不修改进程环境变量；不写文件、不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
 
 ## 契约
 
