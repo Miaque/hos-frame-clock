@@ -5,6 +5,9 @@ from email.policy import default
 from functools import partial
 from io import BytesIO
 import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +26,33 @@ def frame_bytes():
 
 
 class RecognitionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_automatic_token_lookup_and_precedence(self):
+        with TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            project = Path(directory)
+            (project / '.env').write_text('PADDLEOCR_TOKEN="file-token"\n', encoding='utf-8')
+            (project / 'child').mkdir()
+            try:
+                os.chdir(project / 'child')
+                for environment, explicit, expected in (
+                    ({}, {}, 'file-token'),
+                    ({'PADDLEOCR_TOKEN': 'env-token'}, {}, 'env-token'),
+                    ({'PADDLEOCR_TOKEN': 'env-token'}, {'token': 'explicit-token'}, 'explicit-token'),
+                ):
+                    async def handler(request):
+                        self.assertEqual(request.headers['Authorization'], f'bearer {expected}')
+                        return httpx.Response(401)
+                    client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
+                    with patch.dict(os.environ, environment, clear=True), patch('httpx.AsyncClient', client):
+                        with self.assertRaises(OCRServiceError):
+                            await recognize_frame(frame_bytes(), **explicit)
+                        self.assertEqual(dict(os.environ), environment)
+                (project / '.env').write_text('PADDLEOCR_TOKEN=\n', encoding='utf-8')
+                with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+                    await recognize_frame(frame_bytes())
+            finally:
+                os.chdir(previous)
+
     async def test_crops_uploads_and_returns_datetime_and_original_text(self):
         async def handler(request):
             if request.method == "POST":

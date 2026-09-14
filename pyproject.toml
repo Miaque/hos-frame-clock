@@ -1,6 +1,6 @@
 [project]
 name = "hos-frame-clock"
-version = "0.1.0"
+version = "0.1.1"
 description = "Async PP-OCRv6 recognition of timestamps displayed in video frames"
 readme = "README.md"
 authors = [
@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
     "pillow>=12.3.0",
+    "python-dotenv>=1.2.3",
 ]
 
 [build-system]

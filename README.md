@@ -2,19 +2,20 @@
 
 识别单帧图片右上角的日期时间。Python ≥3.12，通过 PP-OCRv6 API 调用，默认总超时 10 秒。
 
+其他项目接入请阅读 [调用方使用文档](docs/caller-guide.md)。
+
 ## 使用
 
-本地运行时在项目根目录 `.env` 中填写 `PADDLEOCR_TOKEN`（字段模板见 `.env.example`），通过 uv 加载：
+在调用项目的 `.env` 中填写 `PADDLEOCR_TOKEN`（字段模板见 `.env.example`），直接运行：
 
 ```powershell
-uv run --env-file .env python examples/recognize.py frame.jpg
+uv run python examples/recognize.py frame.jpg
 ```
 
-`.env` 已加入 Git 忽略规则。作为依赖使用时，调用方加载自己的 `.env` 或环境变量后，将 Token 传入接口：
+`.env` 已加入 Git 忽略规则。库会自动查找并读取配置，直接调用：
 
 ```python
 import asyncio
-import os
 from pathlib import Path
 
 from hos_frame_clock import recognize_frame
@@ -23,7 +24,6 @@ from hos_frame_clock import recognize_frame
 async def main():
     result = await recognize_frame(
         Path("frame.jpg").read_bytes(),
-        token=os.environ["PADDLEOCR_TOKEN"],
         timeout=10.0,
     )
     if result is not None:
@@ -34,7 +34,7 @@ async def main():
 asyncio.run(main())
 ```
 
-运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。模块不读取环境变量、不写文件、不打印日志，凭据由调用方传入。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
+运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。Token 优先级为显式 `token` 参数、进程环境变量、从当前工作目录向父目录查找到的最近 `.env`。仅读取配置，不修改进程环境变量；不写文件、不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
 
 ## 契约
 
@@ -71,7 +71,7 @@ uv run python scripts/publish.py
 依赖项目通过 Nexus 安装固定版本（认证由本机或 CI 的包管理器配置提供；其他公共依赖仍由 uv 默认索引提供，如需统一走 Nexus，应改为管理员提供的 group 索引）：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.1.0"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.1.1"
 ```
 
 每次发布先更新 `pyproject.toml` 的版本，并使用对应版本的构建产物路径。构建产物位于 `dist/`。本仓库不包含凭据。
