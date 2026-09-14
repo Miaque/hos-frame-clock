@@ -20,7 +20,7 @@ __all__ = ["FrameTime", "OCRServiceError", "recognize_frame"]
 _JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 _TIME = re.compile(
     r"(?<![0-9A-Za-z])([0-9]{4})\s*-\s*([0-9]{2})\s*-\s*([0-9]{2})"
-    r"\s+([0-9]{2})\s*:\s*([0-9]{2})\s*:\s*([0-9]{2})(?![0-9A-Za-z:.])"
+    r"\s*([0-9]{2})\s*:\s*([0-9]{2})\s*:\s*([0-9]{2})(?![0-9A-Za-z:.])"
 )
 
 
@@ -45,7 +45,10 @@ def _crop(image_bytes: bytes) -> bytes:
                (height * 12 + 99) // 100)
         with image.crop(box).convert("RGB") as crop:
             output = BytesIO()
-            crop.save(output, format="PNG")
+            with crop.resize(
+                (crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS
+            ) as enlarged:
+                enlarged.save(output, format="PNG")
             return output.getvalue()
 
 

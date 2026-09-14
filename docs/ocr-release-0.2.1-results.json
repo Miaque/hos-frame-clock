@@ -1,0 +1,80 @@
+[
+  {
+    "file": "0765230e8dd7d42f0725ddc6ccfef12e1e0d8f53e49f44bafef828df721207eb.jpg",
+    "expected": "2026-09-13 09:37:51",
+    "actual": "2026-09-13 09:37:51",
+    "seconds": 0.953
+  },
+  {
+    "file": "20260913_085127_854199_visual_events.jpg",
+    "expected": "2026-09-13 08:51:24",
+    "actual": "2026-09-13 08:51:24",
+    "seconds": 0.844
+  },
+  {
+    "file": "20260914_100302_292867_visual_events.jpg",
+    "expected": "2026-09-14 10:02:59",
+    "actual": "2026-09-14 10:02:59",
+    "seconds": 0.859
+  },
+  {
+    "file": "33d2c53e18c74ce4a1b06229e75051a7.png",
+    "expected": "2026-08-15 05:20:17",
+    "actual": "2026-08-15 05:20:17",
+    "seconds": 0.75
+  },
+  {
+    "file": "41cf4369ca5ef1528647d8b9005cbca1647fa9804fbd3f97573c0b30ef7b2fa9.jpg",
+    "expected": "2026-09-13 09:37:53",
+    "actual": "2026-09-13 09:37:53",
+    "seconds": 0.75
+  },
+  {
+    "file": "45a9cb5db18e5f76315003a12efe0d8ca3e12362fa6a5f8f805a0b11d94fd1bd.jpg",
+    "expected": "2026-09-13 18:02:43",
+    "actual": "2026-09-13 18:02:43",
+    "seconds": 0.813
+  },
+  {
+    "file": "51b48e16db11f79bcc10100ec16d0ffc545bfd624a3993e22556c0f035a3fefe.jpg",
+    "expected": "2026-09-14 15:20:08",
+    "actual": "2026-09-14 15:20:08",
+    "seconds": 0.812
+  },
+  {
+    "file": "55bc7bda4baedf200e8db5c16402a12b37355942581f6de73eddac3af0f1b0cb.jpg",
+    "expected": "2026-09-13 07:51:51",
+    "actual": "2026-09-13 07:51:51",
+    "seconds": 0.735
+  },
+  {
+    "file": "7fa170a9dda77bb9c2699b5be781af315024722df6a048b59a491fbb200e8b50.jpg",
+    "expected": "2026-09-14 08:27:06",
+    "actual": "2026-09-14 08:27:06",
+    "seconds": 0.718
+  },
+  {
+    "file": "a8d9f5b0e7f69b86248a57ba8fda3e89663b7cce22ada2b87b3e54b94533ade7.jpg",
+    "expected": "2026-09-14 05:25:36",
+    "actual": "2026-09-14 05:25:36",
+    "seconds": 0.719
+  },
+  {
+    "file": "c655faaf7eb925990adf0bf9402bf8fef8730d0a8ca692f53c8166910705bcbe.jpg",
+    "expected": "2026-09-12 13:46:15",
+    "actual": "2026-09-12 13:46:15",
+    "seconds": 0.86
+  },
+  {
+    "file": "cc8e18c4494c30670cba28f8b40c01be7d904e21e196830a891dfef833f95b0a.jpg",
+    "expected": "2026-09-12 21:21:41",
+    "actual": "2026-09-12 21:21:41",
+    "seconds": 0.703
+  },
+  {
+    "file": "cd96610b9bba6a2e33006c1c033eefc6010d69161fc41df3b10abed16f67b5dc.jpg",
+    "expected": "2026-09-14 17:30:57",
+    "actual": "2026-09-14 17:30:57",
+    "seconds": 0.703
+  }
+]

@@ -99,9 +99,9 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                          for part in message.iter_parts()}
                 self.assertEqual(parts["model"].get_payload(decode=True), b"PP-OCRv6")
                 with Image.open(BytesIO(parts["file"].get_payload(decode=True))) as crop:
-                    self.assertEqual(crop.size, (312, 65))
+                    self.assertEqual(crop.size, (936, 195))
                     self.assertEqual(crop.getpixel((0, 0)), (255, 0, 0))
-                    self.assertEqual(crop.getpixel((311, 64)), (255, 0, 0))
+                    self.assertEqual(crop.getpixel((935, 194)), (255, 0, 0))
                 return httpx.Response(200, json={"data": {"jobId": "job-1"}})
             if request.url.host == "result.test":
                 self.assertNotIn("Authorization", request.headers)
@@ -146,6 +146,20 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                       ["2026-02-30 05:25:36"], ["2026-09-14T05:25:36"],
                       ["2026-09-14 05:25:36.123"],
                       ["2026-09-14 05:25:36", "2026-09-14 05:25:37"]):
+            with self.subTest(texts=texts):
+                self.assertIsNone(await self.run_service(texts=texts))
+
+    async def test_date_and_time_without_whitespace(self):
+        result = await self.run_service(texts=["2026-08-1505:20:17"])
+        self.assertIsNotNone(result)
+        self.assertEqual(result.timestamp.isoformat(), "2026-08-15T05:20:17")
+        self.assertEqual(result.raw_text, "2026-08-1505:20:17")
+        for texts in (
+            ["2026-02-3005:20:17"],
+            ["2026-08-1505:20:17", "2026-08-1505:20:18"],
+            ["2026-08-1505:20:17.123"],
+            ["2026-08-15005:20:17"],
+        ):
             with self.subTest(texts=texts):
                 self.assertIsNone(await self.run_service(texts=texts))
 

@@ -2,10 +2,10 @@
 
 import argparse
 import asyncio
-from pathlib import Path
 import time
+from pathlib import Path
 
-from hos_frame_clock import recognize_frame
+from hos_frame_clock import _crop, recognize_frame
 
 
 async def main():
@@ -13,6 +13,11 @@ async def main():
     parser.add_argument("image", type=Path)
     args = parser.parse_args()
     image_bytes = args.image.read_bytes()
+    output_dir = Path(__file__).resolve().parent / "tmp"
+    output_dir.mkdir(exist_ok=True)
+    crop_path = output_dir / f"{args.image.stem}_crop.png"
+    crop_path.write_bytes(_crop(image_bytes))
+    print(f"裁剪图片：{crop_path}")
     started = time.monotonic()
     result = await recognize_frame(image_bytes)
     print(f"elapsed_seconds={time.monotonic() - started:.3f}")

@@ -12,6 +12,8 @@
 uv run python examples/recognize.py frame.jpg
 ```
 
+示例会先将实际识别区域放大 3 倍后的图片保存到 `examples/tmp/frame_crop.png` 并输出路径，供手动打开查看，再调用 OCR。文件名随原图名称变化，同名图片会被覆盖；该临时目录不纳入 Git。输出耗时仅统计 OCR 调用，不包含裁剪图保存。
+
 `.env` 已加入 Git 忽略规则。库会自动查找并读取配置，直接调用：
 
 ```python
@@ -40,9 +42,9 @@ asyncio.run(main())
 
 - 输入为 JPEG/PNG 编码的 `bytes`，不接收视频、URL、文件路径或 OpenCV 数组。
 - 默认裁剪横向 80%–98%、纵向 0%–12%，从左上角计；左上向下取整，右下向上取整。1728×536 图片对应 `(1382, 0, 1694, 65)`，右下边界不包含在内。当前单路布局改变时需要调整实现。
-- 裁剪后转 RGB PNG 上传，保留裁剪分辨率，不二值化或默认放大。无需安装 PaddleOCR 本地模型。
+- 裁剪后转 RGB，使用 LANCZOS 将宽高各放大 3 倍，再编码为 PNG 上传，不二值化。312×65 的裁剪区域上传为 936×195。无需安装 PaddleOCR 本地模型。
 - 返回不可变 `FrameTime(timestamp: datetime, raw_text: str)`。`timestamp` 不含时区，`raw_text` 保留匹配处原文；OCR 把日期和时间分开时，原文以换行连接。
-- 只接受 `YYYY-MM-DD HH:MM:SS`，允许分隔符附近出现空白，校验日期合法性；不替换 `O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
+- 接受 `YYYY-MM-DD HH:MM:SS`，日期与时间之间的空白可省略（如 `2026-08-1505:20:17`），允许分隔符附近出现空白，校验日期合法性；不替换 `O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
 - 无有效时间，或出现多个不同的有效时间，返回 `None`。相同时间重复出现仍返回一个结果。
 - HTTP、网络、远端任务失败或响应格式异常抛 `OCRServiceError`。超时抛内置 `TimeoutError`。参数错误抛 `ValueError`，图片解码错误可抛 Pillow 的 `OSError`。
 - 10 秒覆盖图片准备、提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。每 0.5 秒轮询，任务只提交一次，不自动重试。
@@ -71,7 +73,7 @@ uv run python scripts/publish.py
 依赖项目通过 Nexus 安装固定版本（认证由本机或 CI 的包管理器配置提供；其他公共依赖仍由 uv 默认索引提供，如需统一走 Nexus，应改为管理员提供的 group 索引）：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.2.0"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.2.1"
 ```
 
 每次发布先更新 `pyproject.toml` 的版本，并使用对应版本的构建产物路径。构建产物位于 `dist/`。本仓库不包含凭据。
@@ -81,3 +83,5 @@ uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-fram
 - [AI Studio OCR 文档](https://ai.baidu.com/ai-doc/AISTUDIO/Kmfl2ycs0)：OCR 结果中的 `prunedResult`。
 - [PaddleOCR 官方 API 客户端测试](https://github.com/PaddlePaddle/PaddleOCR/blob/main/tests/api_client/test_core.py)：任务结果 JSONL 的 `result.ocrResults[].prunedResult.rec_texts` 结构。
 - 任务提交、状态与结果下载协议依据用户提供的 PP-OCRv6 `/api/v2/ocr/jobs` 示例；真实服务验收另行进行。
+
+放大对照实验见 [OCR 放大实验记录](docs/ocr-scale-experiment.md)。
