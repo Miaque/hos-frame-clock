@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import httpx
 from PIL import Image
+from pydantic import ValidationError
 from pydantic_settings import SettingsError
 
 from hos_frame_clock import OCRServiceError, recognize_frame
@@ -28,7 +29,16 @@ def frame_bytes():
     return output.getvalue()
 
 
+def use_tokens(*tokens, concurrency=1):
+    return patch.object(config, 'settings', config.Settings(
+        PADDLEOCR_TOKENS=list(tokens), PADDLEOCR_CONCURRENCY_PER_TOKEN=concurrency,
+    ))
+
+
 class RecognitionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(use_tokens('test-token'))
+
     async def test_automatic_token_lookup_and_precedence(self):
         with TemporaryDirectory() as directory:
             previous = Path.cwd()
@@ -42,10 +52,9 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 os.chdir(project / 'child')
-                for environment, explicit, expected in (
-                    ({}, {}, 'local-token'),
-                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, {}, 'env-token'),
-                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, {'token': 'explicit-token'}, 'explicit-token'),
+                for environment, expected in (
+                    ({}, 'local-token'),
+                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, 'env-token'),
                 ):
                     async def handler(request):
                         self.assertEqual(request.headers['Authorization'], f'bearer {expected}')
@@ -54,19 +63,27 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                     with patch.dict(os.environ, environment, clear=True), patch('httpx.AsyncClient', client):
                         reload(config)
                         with self.assertRaises(OCRServiceError):
-                            await recognize_frame(frame_bytes(), **explicit)
+                            await recognize_frame(frame_bytes())
                         self.assertEqual(dict(os.environ), environment)
-                for environment, explicit in (
-                    ({'PADDLEOCR_TOKENS': '[]'}, {}),
-                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, {'token': ''}),
+                with patch.dict(os.environ, {'PADDLEOCR_CONCURRENCY_PER_TOKEN': '2'}, clear=True):
+                    reload(config)
+                    self.assertEqual(config.settings.concurrency_per_token, 2)
+                for environment in (
+                    {'PADDLEOCR_TOKENS': '[]'},
+                    {'PADDLEOCR_TOKENS': '[""]'},
                 ):
                     with patch.dict(os.environ, environment, clear=True), self.assertRaises(ValueError):
                         reload(config)
-                        await recognize_frame(frame_bytes(), **explicit)
+                        await recognize_frame(frame_bytes())
+                for concurrency in ('0', '-1', 'abc', '1.5'):
+                    environment = {'PADDLEOCR_CONCURRENCY_PER_TOKEN': concurrency}
+                    with patch.dict(os.environ, environment, clear=True), self.assertRaises(ValidationError):
+                        reload(config)
                 (project / 'child' / '.env').unlink()
                 with patch.dict(os.environ, {}, clear=True):
                     reload(config)
                     self.assertEqual(config.settings.tokens, [])
+                    self.assertEqual(config.settings.concurrency_per_token, 1)
                 for content in ('PADDLEOCR_TOKENS=[]\n', 'PADDLEOCR_TOKENS\n', 'OTHER_APP_SETTING=value\n'):
                     (project / 'child' / '.env').write_text(content, encoding='utf-8')
                     with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
@@ -92,36 +109,74 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(OCRServiceError):
                         await recognize_frame(frame_bytes())
 
-    async def test_multiple_tokens_are_used_in_rotation(self):
-        settings = config.Settings(PADDLEOCR_TOKENS=['token-a', 'token-b'])
-        self.assertEqual(
-            [settings.next_token() for _ in range(5)],
-            ['token-a', 'token-b', 'token-a', 'token-b', 'token-a'],
-        )
-        used = []
+    def gated_service(self, started, gate):
+        async def handler(request):
+            if request.method == "POST":
+                started.append(request.headers["Authorization"])
+                await gate.wait()
+                return httpx.Response(200, json={"data": {"jobId": "job-1"}})
+            if request.url.host == "result.test":
+                return httpx.Response(200, text=json.dumps({"result": {"ocrResults": [
+                    {"prunedResult": {"rec_texts": ["2026-09-14 05:25:36"]}}
+                ]}}))
+            return httpx.Response(200, json={"data": {
+                "state": "done", "resultUrl": {"jsonUrl": "https://result.test/data"}
+            }})
+
+        return patch("httpx.AsyncClient", partial(
+            httpx.AsyncClient, transport=httpx.MockTransport(handler)
+        ))
+
+    async def test_calls_wait_for_a_free_token(self):
+        for tokens, concurrency, calls in (
+            (['token-a', 'token-b', 'token-c'], 1, 4),
+            (['token-a'], 2, 3),
+        ):
+            with self.subTest(tokens=tokens, concurrency=concurrency):
+                started, gate = [], asyncio.Event()
+                with use_tokens(*tokens, concurrency=concurrency), self.gated_service(started, gate):
+                    tasks = [asyncio.create_task(recognize_frame(frame_bytes())) for _ in range(calls)]
+                    await asyncio.sleep(0.2)
+                    self.assertEqual(sorted(started), sorted(f"bearer {t}" for t in tokens * concurrency))
+                    gate.set()
+                    results = await asyncio.gather(*tasks)
+                self.assertEqual(len(started), calls)
+                self.assertEqual({r.timestamp.isoformat() for r in results}, {"2026-09-14T05:25:36"})
+
+    async def test_queue_wait_counts_toward_timeout(self):
+        started, gate = [], asyncio.Event()
+        with use_tokens('token-a'), self.gated_service(started, gate):
+            first = asyncio.create_task(recognize_frame(frame_bytes()))
+            await asyncio.sleep(0.05)
+            with self.assertRaises(TimeoutError):
+                await recognize_frame(frame_bytes(), timeout=0.15)
+            gate.set()
+            self.assertIsNotNone(await first)
+        self.assertEqual(started, ["bearer token-a"])
+
+    async def test_token_is_released_after_failure(self):
+        statuses = iter([401, 200])
 
         async def handler(request):
-            used.append(request.headers['Authorization'])
-            return httpx.Response(401)
+            if request.method == "POST":
+                return httpx.Response(next(statuses), json={"data": {"jobId": "job-1"}})
+            if request.url.host == "result.test":
+                return httpx.Response(200, text=json.dumps({"result": {"ocrResults": [
+                    {"prunedResult": {"rec_texts": ["2026-09-14 05:25:36"]}}
+                ]}}))
+            return httpx.Response(200, json={"data": {
+                "state": "done", "resultUrl": {"jsonUrl": "https://result.test/data"}
+            }})
 
         client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-        rotating = config.Settings(PADDLEOCR_TOKENS=['token-a', 'token-b'])
-        with patch.object(config, 'settings', rotating), patch('httpx.AsyncClient', client):
-            results = await asyncio.gather(
-                *(recognize_frame(frame_bytes()) for _ in range(4)),
-                return_exceptions=True,
-            )
-        self.assertTrue(all(isinstance(result, OCRServiceError) for result in results))
-        self.assertEqual(sorted(used), ['bearer token-a'] * 2 + ['bearer token-b'] * 2)
-        with (
-            patch.object(config, 'settings', rotating),
-            patch('httpx.AsyncClient', client),
-            self.assertRaises(OCRServiceError),
-        ):
-            await recognize_frame(frame_bytes(), token='explicit-token')
-        self.assertEqual(used[-1], 'bearer explicit-token')
+        with use_tokens('token-a'), patch("httpx.AsyncClient", client):
+            with self.assertRaises(OCRServiceError):
+                await recognize_frame(frame_bytes())
+            self.assertIsNotNone(await recognize_frame(frame_bytes(), timeout=1))
 
     async def test_crops_uploads_and_returns_datetime_and_original_text(self):
+        expected_size = (936, 195)
+
         async def handler(request):
             if request.method == "POST":
                 self.assertEqual(request.headers["Authorization"], "bearer test-token")
@@ -133,9 +188,10 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                          for part in message.iter_parts()}
                 self.assertEqual(parts["model"].get_payload(decode=True), b"PP-OCRv6")
                 with Image.open(BytesIO(parts["file"].get_payload(decode=True))) as crop:
-                    self.assertEqual(crop.size, (936, 195))
-                    self.assertEqual(crop.getpixel((0, 0)), (255, 0, 0))
-                    self.assertEqual(crop.getpixel((935, 194)), (255, 0, 0))
+                    self.assertEqual(crop.size, expected_size)
+                    if expected_size == (936, 195):
+                        self.assertEqual(crop.getpixel((0, 0)), (255, 0, 0))
+                        self.assertEqual(crop.getpixel((935, 194)), (255, 0, 0))
                 return httpx.Response(200, json={"data": {"jobId": "job-1"}})
             if request.url.host == "result.test":
                 self.assertNotIn("Authorization", request.headers)
@@ -148,9 +204,11 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
         with patch("httpx.AsyncClient", client):
-            result = await recognize_frame(frame_bytes(), token="test-token")
-        self.assertEqual(result.timestamp, datetime(2026, 9, 14, 5, 25, 36))
-        self.assertEqual(result.raw_text, "2026-09-14 05:25:36")
+            result = await recognize_frame(frame_bytes())
+            self.assertEqual(result.timestamp, datetime(2026, 9, 14, 5, 25, 36))
+            self.assertEqual(result.raw_text, "2026-09-14 05:25:36")
+            expected_size = (2592, 804)
+            self.assertIsNotNone(await recognize_frame(frame_bytes(), crop_box=(0.5, 0.5, 1, 1)))
 
     async def run_service(self, *, texts=None, content=None, state="done", status=200,
                           delay_at=None, timeout=10):
@@ -173,7 +231,7 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
         with patch("httpx.AsyncClient", client):
-            return await recognize_frame(frame_bytes(), token="test-token", timeout=timeout)
+            return await recognize_frame(frame_bytes(), timeout=timeout)
 
     async def test_missing_invalid_and_ambiguous_times(self):
         for texts in ([], ["IPC"], ["05:25:36"], ["2026-O9-14 05:25:36"],
@@ -239,7 +297,7 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
         with patch("httpx.AsyncClient", client), self.assertRaises(TimeoutError):
-            await recognize_frame(frame_bytes(), token="test-token", timeout=0.3)
+            await recognize_frame(frame_bytes(), timeout=0.3)
         self.assertEqual(phases, ["POST", "GET", "GET"])
 
     async def test_pending_running_done_sequence(self):
@@ -258,15 +316,20 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
 
         client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
         with patch("httpx.AsyncClient", client):
-            result = await recognize_frame(frame_bytes(), token="test-token")
+            result = await recognize_frame(frame_bytes())
         self.assertEqual(result.timestamp, datetime(2024, 2, 29, 23, 59, 59))
 
     async def test_invalid_input_does_not_call_service(self):
         with patch("httpx.AsyncClient", side_effect=AssertionError("Unexpected network")):
-            for kwargs in ({"image_bytes": b""}, {"token": ""}, {"timeout": 0},
-                           {"timeout": float("nan")}, {"timeout": float("inf")}):
-                arguments = {"image_bytes": frame_bytes(), "token": "test-token", **kwargs}
+            for kwargs in ({"image_bytes": b""}, {"timeout": 0},
+                           {"timeout": float("nan")}, {"timeout": float("inf")},
+                           {"crop_box": (0.5, 0, 0.5, 1)}, {"crop_box": (0, 0.5, 1, 0.5)},
+                           {"crop_box": (-0.1, 0, 1, 1)}, {"crop_box": (0, 0, 1.1, 1)},
+                           {"crop_box": (0, 0, float("nan"), 1)}, {"crop_box": (0, 0, 1)}):
+                arguments = {"image_bytes": frame_bytes(), **kwargs}
                 with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                     await recognize_frame(**arguments)
+            with self.assertRaises(TypeError):
+                await recognize_frame(frame_bytes(), token="test-token")
             with self.assertRaises(OSError):
-                await recognize_frame(b"not an image", token="test-token")
+                await recognize_frame(b"not an image")

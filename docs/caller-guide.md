@@ -1,6 +1,6 @@
 # hos-frame-clock 调用方使用文档
 
-适用版本：`0.3.0`。运行环境：Python ≥3.12、asyncio。
+适用版本：`0.4.0`。运行环境：Python ≥3.12、asyncio。
 
 本库识别视频单帧右上角显示的完整日期时间。调用方负责抽帧，库负责裁剪、调用 PP-OCRv6、轮询及解析结果。无需部署 OCR 服务或安装本地模型，但运行环境需要能够访问 AI Studio 任务端点及其返回的结果下载地址。
 
@@ -9,7 +9,7 @@
 在调用项目目录执行：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.3.0"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.4.0"
 ```
 
 安装包名为 `hos-frame-clock`，Python 导入名为 `hos_frame_clock`。需要能访问内网 Nexus；如仓库要求认证，在调用方的包管理器中配置。安装和调用不需要 Maven 配置，Maven 凭据仅用于本库的发布脚本。
@@ -22,9 +22,10 @@ uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-fram
 
 ```dotenv
 PADDLEOCR_TOKENS=["填写你的真实Token","可选的第二个Token"]
+PADDLEOCR_CONCURRENCY_PER_TOKEN=1
 ```
 
-值为 JSON 数组，至少填写一个 Token。只有一个时写成 `PADDLEOCR_TOKENS=["填写你的真实Token"]`。
+`PADDLEOCR_TOKENS` 为 JSON 数组，至少填写一个 Token。只有一个时写成 `PADDLEOCR_TOKENS=["填写你的真实Token"]`。`PADDLEOCR_CONCURRENCY_PER_TOKEN` 为每个 Token 同时允许的在途请求数，≥1 的整数，可省略，默认 1。
 
 在调用项目的 `.gitignore` 中添加：
 
@@ -38,9 +39,9 @@ PADDLEOCR_TOKENS=["填写你的真实Token","可选的第二个Token"]
 uv run python main.py
 ```
 
-初始化配置时，库优先读取进程环境变量 `PADDLEOCR_TOKENS`；不存在时，读取当前工作目录的 `.env`，不向父目录查找。调用方无需手动加载。显式 `token` 参数优先级最高，已有空值会报 `ValueError`，不会回退。建议从调用项目根目录启动；不会按库的安装位置查找配置，也不会修改进程环境变量。部署时可直接注入同名环境变量。
+初始化配置时，库优先读取进程环境变量；不存在时，读取当前工作目录的 `.env`，不向父目录查找。调用方无需手动加载，也不能通过函数参数传入 Token。建议从调用项目根目录启动；不会按库的安装位置查找配置，也不会修改进程环境变量。部署时可直接注入同名环境变量。
 
-配置多个 Token 时，未显式传入 `token` 的调用按配置顺序轮询取用下一个，四个并发调用在两个 Token 上各用两次。轮询不做可用性检查，某个 Token 失效或限流时不会自动换用其他 Token 重试，调用方需要自行处理 `OCRServiceError` 并决定是否重试。空数组或轮询取到空字符串同样报 `ValueError`；值不是合法 JSON 数组（例如写成 `PADDLEOCR_TOKENS=abc` 或留空）时，库在首次导入阶段抛出 `pydantic_settings.SettingsError`。
+每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN` 个在途请求，最大并发为 Token 数乘以该值。三个 Token、默认值 1 时，第四个并发调用会等待最先空闲的 Token，等待时间计入 `timeout`，等不到抛 `TimeoutError`；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，某个 Token 失效或限流时不会自动换用其他 Token 重试，调用方需要自行处理 `OCRServiceError` 并决定是否重试。空数组或取到空字符串报 `ValueError`；`PADDLEOCR_TOKENS` 不是合法 JSON 数组（例如写成 `PADDLEOCR_TOKENS=abc` 或留空）时，库在首次导入阶段抛出 `pydantic_settings.SettingsError`；`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
 
 ## 3. 完整调用示例
 
@@ -86,28 +87,27 @@ if __name__ == "__main__":
 
 ## 4. 接口参数
 
-公共接口：`await recognize_frame(image_bytes, *, token=None, timeout=10.0, job_url=默认任务地址)`。
+公共接口：`await recognize_frame(image_bytes, *, timeout=10.0, job_url=默认任务地址, crop_box=(0.80, 0.0, 0.98, 0.12))`。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `image_bytes` | `bytes` | 是 | 完整单帧图片的 JPEG/PNG 编码内容 |
-| `token` | `str \| None` | 否 | 默认从 `PADDLEOCR_TOKENS` 轮询取用下一个；显式传入时覆盖自动配置且不消耗轮询 |
 | `timeout` | `float` | 否 | 全过程超时秒数，默认 10，必须为有限正数 |
 | `job_url` | `str` | 否 | 兼容同一任务协议的端点地址，一般无需修改 |
+| `crop_box` | `tuple[float, float, float, float]` | 否 | 识别区域 `(left, top, right, bottom)`，为帧宽高的比例，默认右上角 |
 
 默认任务地址：`https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
 
 输入不接受文件路径、图片 URL、视频文件或 OpenCV 数组。文件需要先读取为字节；已有 OpenCV 帧时，应由调用方先编码为 JPEG/PNG，再传入编码后的字节，而不是原始像素数组的 `tobytes()`。
 
-## 5. 裁剪范围与画面要求
+## 5. 识别区域与画面要求
 
 **传入完整帧，不要先裁剪右上角**，否则库会再次按比例裁剪，可能丢失时间文字。
 
-- 以图片左上角为原点，识别区域为横向 80%–98%、纵向 0%–12%。
-- 对于 1728×536 图片，像素区域为 `(1382, 0, 1694, 65)`，右下边界不包含在内。
-- 裁剪后转 RGB，使用 LANCZOS 将宽高各放大 3 倍，再以 PNG 上传；上述示例上传尺寸为 936×195。
-- 该范围针对当前单路画面确定，适用于相同布局的同比例缩放。
-- `0.3.0` 不提供裁剪区域参数。接入其他布局的摄像头前，需要确认时间文字完整落在该区域内。
+- 识别区域由 `crop_box=(left, top, right, bottom)` 指定，以图片左上角为原点、帧宽高的比例表示，要求 `0 ≤ left < right ≤ 1`、`0 ≤ top < bottom ≤ 1`，否则在发起请求前抛 `ValueError`。
+- 默认 `(0.80, 0.0, 0.98, 0.12)`，即横向 80%–98%、纵向 0%–12%；对于 1728×536 图片，像素区域为 `(1382, 0, 1694, 65)`，左上向下取整，右下向上取整，右下边界不包含在内。
+- 裁剪后转 RGB，使用 LANCZOS 将宽高各放大 3 倍，再以 PNG 上传；上述默认区域上传尺寸为 936×195。
+- 默认区域针对当前单路画面确定，适用于相同布局的同比例缩放。接入其他布局的摄像头时，先用 `examples/recognize.py --crop-box ...` 查看保存的裁剪图，确认时间文字完整落在区域内，再在调用中传入同样的 `crop_box`。
 - 支持的画面时间格式为 `YYYY-MM-DD HH:MM:SS`，日期与时间之间的空白可省略（如 `2026-08-1505:20:17`），允许分隔符附近出现空白，返回的 `raw_text` 保留原文；不猜测替换 `O/0` 等字符，不补日期，不支持 ISO `T` 或毫秒格式。
 
 ## 6. 返回值与异常
@@ -126,7 +126,7 @@ if __name__ == "__main__":
 | `None` | 未找到合法完整时间，或存在多个不同的有效时间 | 按业务标记本帧未识别，不能当作服务故障 |
 | `TimeoutError` | 超过总期限或发生 HTTP 超时 | 按业务决定是否稍后重试 |
 | `OCRServiceError` | HTTP、网络、鉴权、任务失败或响应结构异常 | 记录异常类别并检查配置或服务状态 |
-| `ValueError` | 空输入、空 Token、非法超时或不支持的图片格式等 | 修正输入 |
+| `ValueError` | 空输入、未配置或空 Token、非法超时、非法 `crop_box` 或不支持的图片格式等 | 修正输入 |
 | `OSError` | 图片解码失败等 Pillow 错误 | 检查图片内容 |
 | `asyncio.CancelledError` | 调用任务被取消 | 保留取消语义，让异常向上传播 |
 
@@ -136,6 +136,6 @@ if __name__ == "__main__":
 
 默认 10 秒覆盖图片准备、任务提交、轮询、结果下载和解析，不是每次 HTTP 请求分别获得 10 秒。调用前自行抽帧、下载原图、读取文件的时间不计入此期限。
 
-每次调用提交一个远端任务，内部每 0.5 秒轮询一次，不自动重试，也不提供缓存或批量入口。超时或取消只结束本地等待，不代表远端任务已取消；调用方再次调用会提交新任务。多帧处理时由调用方管理调用频率和并发；库本身不限制并发数，配置多个 Token 只是把并发请求分散到不同凭据，不改变单次调用的超时和重试语义。
+每次调用提交一个远端任务，内部每 0.5 秒轮询一次，不自动重试，也不提供缓存或批量入口。超时或取消只结束本地等待，不代表远端任务已取消；调用方再次调用会提交新任务。最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用在库内排队，排队时间计入 `timeout`；调用方仍需控制整体调用频率，避免大量调用在队列中等到超时。
 
 本库不写输出文件、不打印日志；是否保存时间、原文及耗时由调用方决定。

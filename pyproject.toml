@@ -1,6 +1,6 @@
 [project]
 name = "hos-frame-clock"
-version = "0.3.0"
+version = "0.4.0"
 description = "Async PP-OCRv6 recognition of timestamps displayed in video frames"
 readme = "README.md"
 authors = [

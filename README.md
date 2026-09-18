@@ -12,7 +12,7 @@
 uv run python examples/recognize.py frame.jpg
 ```
 
-示例会先将实际识别区域放大 3 倍后的图片保存到 `examples/tmp/frame_crop.png` 并输出路径，供手动打开查看，再调用 OCR。文件名随原图名称变化，同名图片会被覆盖；该临时目录不纳入 Git。输出耗时仅统计 OCR 调用，不包含裁剪图保存。
+示例会先将实际识别区域放大 3 倍后的图片保存到 `examples/tmp/frame_crop.png` 并输出路径，供手动打开查看，再调用 OCR。文件名随原图名称变化，同名图片会被覆盖；该临时目录不纳入 Git。输出耗时仅统计 OCR 调用，不包含裁剪图保存。需要改变识别区域时加 `--crop-box LEFT TOP RIGHT BOTTOM`（帧宽高的比例，默认 `0.80 0 0.98 0.12`）。
 
 `.env` 已加入 Git 忽略规则。库会自动查找并读取配置，直接调用：
 
@@ -36,19 +36,19 @@ async def main():
 asyncio.run(main())
 ```
 
-运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。环境配置使用 `pydantic-settings` 的全局实例管理，在首次导入库时加载一次；请在导入前设置环境变量并确定工作目录，后续环境变量或 `.env` 修改需重启进程生效。`PADDLEOCR_TOKENS` 为 JSON 数组（如 `["token1","token2"]`），未显式传入 `token` 时按配置顺序轮询取用下一个，并发调用因而分散到不同 Token。Token 优先级为显式 `token` 参数、进程环境变量、当前工作目录的 `.env`。使用 UTF-8 编码，忽略 `.env` 中其他应用的配置项；空数组或轮询取到空 Token 会报 `ValueError`，不向低优先级配置回退；值不是合法 JSON 数组时，在首次导入阶段抛出 `pydantic_settings.SettingsError`。仅读取配置，不修改进程环境变量；不写文件、不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
+运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。环境配置使用 `pydantic-settings` 的全局实例管理，在首次导入库时加载一次；请在导入前设置环境变量并确定工作目录，后续环境变量或 `.env` 修改需重启进程生效。`PADDLEOCR_TOKENS` 为 JSON 数组（如 `["token1","token2"]`），每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN`（默认 1）个在途请求，所有 Token 都占满时新调用排队等待最先空闲的 Token，等待时间计入 `timeout`。配置优先级为进程环境变量、当前工作目录的 `.env`；Token 不能通过参数传入。使用 UTF-8 编码，忽略 `.env` 中其他应用的配置项；空数组或取到空 Token 会报 `ValueError`，不向低优先级配置回退；`PADDLEOCR_TOKENS` 不是合法 JSON 数组时，在首次导入阶段抛出 `pydantic_settings.SettingsError`，`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。仅读取配置，不修改进程环境变量；不写文件、不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`；可通过 `crop_box` 指定识别区域。
 
 ## 契约
 
 - 输入为 JPEG/PNG 编码的 `bytes`，不接收视频、URL、文件路径或 OpenCV 数组。
-- 默认裁剪横向 80%–98%、纵向 0%–12%，从左上角计；左上向下取整，右下向上取整。1728×536 图片对应 `(1382, 0, 1694, 65)`，右下边界不包含在内。当前单路布局改变时需要调整实现。
+- 识别区域由 `crop_box=(left, top, right, bottom)` 指定，为帧宽高的比例，要求 `0 ≤ left < right ≤ 1`、`0 ≤ top < bottom ≤ 1`，否则抛 `ValueError`；默认 `(0.80, 0.0, 0.98, 0.12)`，即右上角横向 80%–98%、纵向 0%–12%。像素框左上向下取整，右下向上取整。1728×536 图片默认对应 `(1382, 0, 1694, 65)`，右下边界不包含在内。
 - 裁剪后转 RGB，使用 LANCZOS 将宽高各放大 3 倍，再编码为 PNG 上传，不二值化。312×65 的裁剪区域上传为 936×195。无需安装 PaddleOCR 本地模型。
 - 返回不可变 `FrameTime(timestamp: datetime, raw_text: str)`。`timestamp` 不含时区，`raw_text` 保留匹配处原文；OCR 把日期和时间分开时，原文以换行连接。
 - 接受 `YYYY-MM-DD HH:MM:SS`，日期与时间之间的空白可省略（如 `2026-08-1505:20:17`），允许分隔符附近出现空白，校验日期合法性；不替换 `O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
 - 无有效时间，或出现多个不同的有效时间，返回 `None`。相同时间重复出现仍返回一个结果。
 - HTTP、网络、远端任务失败或响应格式异常抛 `OCRServiceError`。超时抛内置 `TimeoutError`。参数错误抛 `ValueError`，图片解码错误可抛 Pillow 的 `OSError`。
-- 10 秒覆盖图片准备、提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。每 0.5 秒轮询，任务只提交一次，不自动重试。
-- `PADDLEOCR_TOKENS` 配置多个 Token 时按配置顺序轮询，每次调用取一个；不做可用性检查，失败也不换 Token 重试。库不限制并发，并发数和调用频率由调用方控制。
+- 10 秒覆盖图片准备、等待空闲 Token、提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。每 0.5 秒轮询，任务只提交一次，不自动重试。
+- 最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用排队，先到先得，谁先空闲用谁；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，失败也不换 Token 重试。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
 - 调用方取消会继续传播 `asyncio.CancelledError`。本地超时或取消不代表服务端任务已取消；图片处理线程也可能在后台完成，但不会继续发起 OCR 请求。
 
 ## 开发与验证
@@ -74,7 +74,7 @@ uv run python scripts/publish.py
 依赖项目通过 Nexus 安装固定版本（认证由本机或 CI 的包管理器配置提供；其他公共依赖仍由 uv 默认索引提供，如需统一走 Nexus，应改为管理员提供的 group 索引）：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.3.0"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.4.0"
 ```
 
 每次发布先更新 `pyproject.toml` 的版本，并使用对应版本的构建产物路径。构建产物位于 `dist/`。本仓库不包含凭据。

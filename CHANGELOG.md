@@ -1,5 +1,18 @@
 # 更新记录
 
+## 0.4.0（2026-09-18）
+
+### 变更
+
+- 按 Token 限制在途请求：每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN`（默认 1）个请求，最大并发为 Token 数乘以该值，超出的调用排队等待最先空闲的 Token，等待时间计入 `timeout`。
+- 移除 `recognize_frame` 的 `token` 参数，Token 只来自 `PADDLEOCR_TOKENS` 环境变量或当前工作目录的 `.env`。
+- 新增 `crop_box=(left, top, right, bottom)` 参数指定识别区域（帧宽高的比例），默认 `(0.80, 0.0, 0.98, 0.12)` 与原行为一致；`examples/recognize.py` 对应新增 `--crop-box`。
+- `PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时，在首次导入阶段抛出 `pydantic.ValidationError`。
+
+### 升级说明
+
+从 0.3.0 升级时，删除调用中的 `token=` 参数（继续传入会得到 `TypeError`），改为在配置中提供 Token。默认配额 1 意味着并发上限等于 Token 数，原先依赖无限并发的调用方应按需调高 `PADDLEOCR_CONCURRENCY_PER_TOKEN` 或增加 Token，否则超出部分会排队直至超时。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
+
 ## 0.3.0（2026-09-17）
 
 ### 变更
