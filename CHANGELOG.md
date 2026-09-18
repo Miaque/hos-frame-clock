@@ -1,5 +1,17 @@
 # 更新记录
 
+## 0.3.0（2026-09-17）
+
+### 变更
+
+- Token 配置改为数组：环境变量由 `PADDLEOCR_TOKEN` 改名为 `PADDLEOCR_TOKENS`，值为 JSON 数组。
+- 未显式传入 `token` 时按配置顺序轮询取用下一个 Token，并发调用因而分散到不同凭据。
+- 配置为空数组或未配置时仍抛出 `ValueError`；值不是合法 JSON 数组时，在首次导入阶段抛出 `pydantic_settings.SettingsError`。
+
+### 升级说明
+
+从 0.2.1 升级时，将 `.env` 或部署环境中的 `PADDLEOCR_TOKEN=你的Token` 改写为 `PADDLEOCR_TOKENS=["你的Token"]`；旧变量名不再读取，也不作为回退。显式 `token` 参数的用法和优先级不变，传入时不消耗轮询。轮询不做可用性检查，失效 Token 不会被跳过或重试，调用方仍需自行处理 `OCRServiceError`。
+
 ## 0.2.1（2026-09-14）
 
 - 裁剪后使用 LANCZOS 统一放大 3 倍，改善小字和复杂背景时间识别，保持单次提交。

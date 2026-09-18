@@ -100,6 +100,8 @@ async def recognize_frame(
     """识别单帧 JPEG/PNG 图片右上角固定区域的日期时间。
 
     ``timeout`` 覆盖图片准备、任务提交、轮询和结果获取。
+    未显式传入 ``token`` 时，按配置顺序轮询取用 ``PADDLEOCR_TOKENS`` 中的下一个 Token，
+    并发调用因而分散到不同 Token。
     超时抛出 ``TimeoutError``，服务失败抛出 ``OCRServiceError``，
     无效图片抛出参数校验异常或 Pillow 异常。
     调用方取消继续向上传播。凭据仅发送到任务端点。
@@ -107,9 +109,9 @@ async def recognize_frame(
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise ValueError("image_bytes 必须为非空的 JPEG/PNG 编码字节")
     if token is None:
-        token = config.settings.token
+        token = config.settings.next_token()
     if not isinstance(token, str) or not token.strip():
-        raise ValueError("请在导入前通过 .env 或环境变量设置 PADDLEOCR_TOKEN，或传入非空 token")
+        raise ValueError("请在导入前通过 .env 或环境变量设置 PADDLEOCR_TOKENS，或传入非空 token")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout 必须为有限正数")
     headers = {"Authorization": f"bearer {token}"}

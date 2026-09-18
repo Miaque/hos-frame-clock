@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import httpx
 from PIL import Image
+from pydantic_settings import SettingsError
 
 from hos_frame_clock import OCRServiceError, recognize_frame
 from hos_frame_clock import config
@@ -33,18 +34,18 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
             previous = Path.cwd()
             original_settings = config.settings
             project = Path(directory)
-            (project / '.env').write_text('PADDLEOCR_TOKEN="file-token"\n', encoding='utf-8')
+            (project / '.env').write_text('PADDLEOCR_TOKENS=["file-token"]\n', encoding='utf-8')
             (project / 'child').mkdir()
             (project / 'child' / '.env').write_text(
-                'PADDLEOCR_TOKEN="local-token"\nOTHER_APP_SETTING=value\n',
+                'PADDLEOCR_TOKENS=["local-token"]\nOTHER_APP_SETTING=value\n',
                 encoding='utf-8',
             )
             try:
                 os.chdir(project / 'child')
                 for environment, explicit, expected in (
                     ({}, {}, 'local-token'),
-                    ({'PADDLEOCR_TOKEN': 'env-token'}, {}, 'env-token'),
-                    ({'PADDLEOCR_TOKEN': 'env-token'}, {'token': 'explicit-token'}, 'explicit-token'),
+                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, {}, 'env-token'),
+                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, {'token': 'explicit-token'}, 'explicit-token'),
                 ):
                     async def handler(request):
                         self.assertEqual(request.headers['Authorization'], f'bearer {expected}')
@@ -56,8 +57,8 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                             await recognize_frame(frame_bytes(), **explicit)
                         self.assertEqual(dict(os.environ), environment)
                 for environment, explicit in (
-                    ({'PADDLEOCR_TOKEN': ''}, {}),
-                    ({'PADDLEOCR_TOKEN': 'env-token'}, {'token': ''}),
+                    ({'PADDLEOCR_TOKENS': '[]'}, {}),
+                    ({'PADDLEOCR_TOKENS': '["env-token"]'}, {'token': ''}),
                 ):
                     with patch.dict(os.environ, environment, clear=True), self.assertRaises(ValueError):
                         reload(config)
@@ -65,27 +66,60 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                 (project / 'child' / '.env').unlink()
                 with patch.dict(os.environ, {}, clear=True):
                     reload(config)
-                    self.assertIsNone(config.settings.token)
-                for content in ('PADDLEOCR_TOKEN=\n', 'PADDLEOCR_TOKEN\n', 'OTHER_APP_SETTING=value\n'):
+                    self.assertEqual(config.settings.tokens, [])
+                for content in ('PADDLEOCR_TOKENS=[]\n', 'PADDLEOCR_TOKENS\n', 'OTHER_APP_SETTING=value\n'):
                     (project / 'child' / '.env').write_text(content, encoding='utf-8')
                     with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
                         reload(config)
                         await recognize_frame(frame_bytes())
+                for content in ('PADDLEOCR_TOKENS=\n', 'PADDLEOCR_TOKENS=local-token\n'):
+                    (project / 'child' / '.env').write_text(content, encoding='utf-8')
+                    with patch.dict(os.environ, {}, clear=True), self.assertRaises(SettingsError):
+                        reload(config)
             finally:
                 os.chdir(previous)
                 config.settings = original_settings
 
     async def test_configuration_is_loaded_once(self):
-        with patch.object(config, 'settings', config.Settings(PADDLEOCR_TOKEN='initial-token')):
+        with patch.object(config, 'settings', config.Settings(PADDLEOCR_TOKENS=['initial-token'])):
             async def handler(request):
                 self.assertEqual(request.headers['Authorization'], 'bearer initial-token')
                 return httpx.Response(401)
 
             client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-            with patch.dict(os.environ, {'PADDLEOCR_TOKEN': 'changed-token'}), patch('httpx.AsyncClient', client):
+            with patch.dict(os.environ, {'PADDLEOCR_TOKENS': '["changed-token"]'}), patch('httpx.AsyncClient', client):
                 for _ in range(2):
                     with self.assertRaises(OCRServiceError):
                         await recognize_frame(frame_bytes())
+
+    async def test_multiple_tokens_are_used_in_rotation(self):
+        settings = config.Settings(PADDLEOCR_TOKENS=['token-a', 'token-b'])
+        self.assertEqual(
+            [settings.next_token() for _ in range(5)],
+            ['token-a', 'token-b', 'token-a', 'token-b', 'token-a'],
+        )
+        used = []
+
+        async def handler(request):
+            used.append(request.headers['Authorization'])
+            return httpx.Response(401)
+
+        client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
+        rotating = config.Settings(PADDLEOCR_TOKENS=['token-a', 'token-b'])
+        with patch.object(config, 'settings', rotating), patch('httpx.AsyncClient', client):
+            results = await asyncio.gather(
+                *(recognize_frame(frame_bytes()) for _ in range(4)),
+                return_exceptions=True,
+            )
+        self.assertTrue(all(isinstance(result, OCRServiceError) for result in results))
+        self.assertEqual(sorted(used), ['bearer token-a'] * 2 + ['bearer token-b'] * 2)
+        with (
+            patch.object(config, 'settings', rotating),
+            patch('httpx.AsyncClient', client),
+            self.assertRaises(OCRServiceError),
+        ):
+            await recognize_frame(frame_bytes(), token='explicit-token')
+        self.assertEqual(used[-1], 'bearer explicit-token')
 
     async def test_crops_uploads_and_returns_datetime_and_original_text(self):
         async def handler(request):
