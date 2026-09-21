@@ -245,7 +245,17 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_service(texts=["2026-08-1505:20:17"])
         self.assertIsNotNone(result)
         self.assertEqual(result.timestamp.isoformat(), "2026-08-15T05:20:17")
-        self.assertEqual(result.raw_text, "2026-08-1505:20:17")
+        self.assertEqual(result.raw_text, "2026-08-15 05:20:17")
+        for text, expected in (
+            ("2026-09-2121:50:35", "2026-09-21 21:50:35"),
+            ("2026-09-21 21:50:45", "2026-09-21 21:50:45"),
+            ("2026-09-2121:49:29&#x20;", "2026-09-21 21:49:29"),
+            ("2026-09-2121:49:30&#x20;", "2026-09-21 21:49:30"),
+        ):
+            with self.subTest(text=text):
+                result = await self.run_service(texts=[text])
+                self.assertIsNotNone(result)
+                self.assertEqual(result.raw_text, expected)
         for texts in (
             ["2026-02-3005:20:17"],
             ["2026-08-1505:20:17", "2026-08-1505:20:18"],

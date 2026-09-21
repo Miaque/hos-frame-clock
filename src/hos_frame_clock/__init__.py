@@ -27,7 +27,7 @@ _TIME = re.compile(
 
 @dataclass(frozen=True)
 class FrameTime:
-    """不含时区的画面时间及匹配的 OCR 原文。"""
+    """不含时区的画面时间及匹配的 OCR 文本。"""
 
     timestamp: datetime
     raw_text: str
@@ -79,7 +79,11 @@ def _parse_result(content: str) -> FrameTime | None:
                         timestamp = datetime(*(int(part) for part in match.groups()))
                     except ValueError:
                         continue
-                    matches.setdefault(timestamp, match.group())
+                    raw_text = match.group()
+                    if match.end(3) == match.start(4):
+                        day_end = match.end(3) - match.start()
+                        raw_text = f"{raw_text[:day_end]} {raw_text[day_end:]}"
+                    matches.setdefault(timestamp, raw_text)
     except (KeyError, TypeError, ValueError) as exc:
         raise OCRServiceError("OCR 结果文档格式无效") from exc
     if len(matches) == 1:
