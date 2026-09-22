@@ -17,7 +17,7 @@ from PIL import Image
 from pydantic import ValidationError
 from pydantic_settings import SettingsError
 
-from hos_frame_clock import OCRServiceError, recognize_frame
+from hos_frame_clock import OCRRateLimitedError, OCRServiceError, recognize_frame
 from hos_frame_clock import config
 
 
@@ -279,6 +279,14 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                        {"texts": "2026-09-14 05:25:36"}):
             with self.subTest(kwargs=kwargs), self.assertRaises(OCRServiceError):
                 await self.run_service(**kwargs)
+
+    async def test_rate_limiting_raises_a_distinguishable_error(self):
+        with self.assertRaises(OCRRateLimitedError) as limited:
+            await self.run_service(status=429)
+        self.assertIsInstance(limited.exception, OCRServiceError)
+        with self.assertRaises(OCRServiceError) as other:
+            await self.run_service(status=503)
+        self.assertNotIsInstance(other.exception, OCRRateLimitedError)
 
     async def test_timeout_covers_every_network_stage_and_poll_wait(self):
         for phase in ("submit", "poll", "download", None):

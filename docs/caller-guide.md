@@ -41,7 +41,7 @@ uv run python main.py
 
 初始化配置时，库优先读取进程环境变量；不存在时，读取当前工作目录的 `.env`，不向父目录查找。调用方无需手动加载，也不能通过函数参数传入 Token。建议从调用项目根目录启动；不会按库的安装位置查找配置，也不会修改进程环境变量。部署时可直接注入同名环境变量。
 
-每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN` 个在途请求，最大并发为 Token 数乘以该值。三个 Token、默认值 1 时，第四个并发调用会等待最先空闲的 Token，等待时间计入 `timeout`，等不到抛 `TimeoutError`；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，某个 Token 失效或限流时不会自动换用其他 Token 重试，调用方需要自行处理 `OCRServiceError` 并决定是否重试。空数组或取到空字符串报 `ValueError`；`PADDLEOCR_TOKENS` 不是合法 JSON 数组（例如写成 `PADDLEOCR_TOKENS=abc` 或留空）时，库在首次导入阶段抛出 `pydantic_settings.SettingsError`；`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
+每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN` 个在途请求，最大并发为 Token 数乘以该值。三个 Token、默认值 1 时，第四个并发调用会等待最先空闲的 Token，等待时间计入 `timeout`，等不到抛 `TimeoutError`；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，某个 Token 失效或限流时不会自动换用其他 Token 重试，调用方需要自行处理 `OCRServiceError`（服务端限流为其子类 `OCRRateLimitedError`）并决定是否重试。空数组或取到空字符串报 `ValueError`；`PADDLEOCR_TOKENS` 不是合法 JSON 数组（例如写成 `PADDLEOCR_TOKENS=abc` 或留空）时，库在首次导入阶段抛出 `pydantic_settings.SettingsError`；`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
 
 ## 3. 完整调用示例
 
@@ -51,7 +51,7 @@ uv run python main.py
 import asyncio
 from pathlib import Path
 
-from hos_frame_clock import OCRServiceError, recognize_frame
+from hos_frame_clock import OCRRateLimitedError, OCRServiceError, recognize_frame
 
 
 async def main() -> None:
@@ -61,6 +61,9 @@ async def main() -> None:
         result = await recognize_frame(image_bytes, timeout=10.0)
     except TimeoutError:
         print("识别超时")
+        return
+    except OCRRateLimitedError:
+        print("服务端限流，应降低并发或退避后重试")
         return
     except OCRServiceError:
         print("OCR 服务调用失败")
@@ -126,16 +129,61 @@ if __name__ == "__main__":
 | `None` | 未找到合法完整时间，或存在多个不同的有效时间 | 按业务标记本帧未识别，不能当作服务故障 |
 | `TimeoutError` | 超过总期限或发生 HTTP 超时 | 按业务决定是否稍后重试 |
 | `OCRServiceError` | HTTP、网络、鉴权、任务失败或响应结构异常 | 记录异常类别并检查配置或服务状态 |
+| `OCRRateLimitedError` | 服务端限流（HTTP 429），是 `OCRServiceError` 的子类 | 降低并发或退避后自行重试；库不自动重试。捕获顺序须排在 `OCRServiceError` 之前 |
 | `ValueError` | 空输入、未配置或空 Token、非法超时、非法 `crop_box` 或不支持的图片格式等 | 修正输入 |
 | `OSError` | 图片解码失败等 Pillow 错误 | 检查图片内容 |
 | `asyncio.CancelledError` | 调用任务被取消 | 保留取消语义，让异常向上传播 |
 
-相同时间重复出现仍可返回结果。错误信息不是稳定的细分错误码，不应通过匹配错误文本区分鉴权失败和其他服务错误。
+相同时间重复出现仍可返回结果。错误信息不是稳定的细分错误码，不应通过匹配错误文本区分鉴权失败和其他服务错误；需要单独识别限流时按 `OCRRateLimitedError` 类型捕获。
 
 ## 7. 超时与重试
 
 默认 10 秒覆盖图片准备、任务提交、轮询、结果下载和解析，不是每次 HTTP 请求分别获得 10 秒。调用前自行抽帧、下载原图、读取文件的时间不计入此期限。
 
-每次调用提交一个远端任务，内部每 0.5 秒轮询一次，不自动重试，也不提供缓存或批量入口。超时或取消只结束本地等待，不代表远端任务已取消；调用方再次调用会提交新任务。最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用在库内排队，排队时间计入 `timeout`；调用方仍需控制整体调用频率，避免大量调用在队列中等到超时。
+每次调用提交一个远端任务，内部每 0.5 秒轮询一次，不自动重试，也不提供缓存或批量入口。超时或取消只结束本地等待，不代表远端任务已取消；调用方再次调用会提交新任务。最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用在库内排队，排队时间计入 `timeout`；调用方仍需控制整体调用频率，避免大量调用在队列中等到超时，批量调用的限流方式和并发取值见第 8 节。
 
 本库不写输出文件、不打印日志；是否保存时间、原文及耗时由调用方决定。
+
+## 8. 批量调用
+
+库内排队的等待时间计入每个调用自己的 `timeout`，因此一次性投递整批会让尾部调用在队列里耗尽预算，批量越大失败比例越高。可承受的单批大小约为：
+
+```
+安全批量 ≈ 实际吞吐（次/秒） × timeout（秒）
+```
+
+**调用方应自行限制在途数量**，把同时进入 `recognize_frame` 的调用数压到最大并发附近，使每个调用的 `timeout` 基本不消耗在排队上：
+
+```python
+import asyncio
+
+from hos_frame_clock import FrameTime, recognize_frame
+
+
+async def recognize_batch(frames: list[bytes]) -> list[FrameTime | None | BaseException]:
+    semaphore = asyncio.Semaphore(6)  # = Token 数 × PADDLEOCR_CONCURRENCY_PER_TOKEN
+
+    async def recognize_one(frame: bytes) -> FrameTime | None:
+        async with semaphore:
+            return await recognize_frame(frame, timeout=10.0)
+
+    return await asyncio.gather(
+        *(recognize_one(frame) for frame in frames), return_exceptions=True
+    )
+```
+
+排队饿死的特征是耗时精确等于 `timeout`，且失败数量随批量规模增长；不能通过异常的 `__cause__` 与服务端响应慢区分，两者都可能表现为 `httpx.TimeoutException`。
+
+### 并发取值的实测参考
+
+2026-09-22 用 3 个 Token、1728×536 样图、`timeout=10` 实测，服务处于热态时单次识别中位耗时 0.67 秒：
+
+| `PADDLEOCR_CONCURRENCY_PER_TOKEN` | 最大在途 | 60 并发结果 | 吞吐 |
+| --- | --- | --- | --- |
+| 1 | 3 | 45 成功，15 次 `TimeoutError` | 约 4.5 次/秒 |
+| 2 | 6 | 60 成功 | 约 8.5 次/秒 |
+| 3 | 9 | 51 成功，9 次 `OCRRateLimitedError`（HTTP 429） | — |
+
+取值过低时批量尾部排队超时，过高时触发服务端限流；该样本下 2 是可用区间。提高该值只提升吞吐，不改变批量超过安全批量即尾部失败这一点：并发取 2 时投递 120 个并发调用，仍有 36 个超时。
+
+以上是单次实测，不代表服务始终如此。服务空闲后首批调用会遇到实例冷启动，实测出现过单次 29.5 秒，安全批量需按最差吞吐留余量，或相应调大 `timeout`。HTTP 429 的限流粒度是账号级还是 Token 级未分离验证，增加 Token 数不一定线性提升吞吐，扩容前应重新实测。

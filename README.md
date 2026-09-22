@@ -46,7 +46,7 @@ asyncio.run(main())
 - 返回不可变 `FrameTime(timestamp: datetime, raw_text: str)`。`timestamp` 不含时区；`raw_text` 保留匹配处原文，但日期与时间紧邻时会补一个空格，OCR 把日期和时间分开时仍以换行连接。
 - 接受 `YYYY-MM-DD HH:MM:SS`，日期与时间之间的空白可省略（如 `2026-08-1505:20:17`，返回的 `raw_text` 为 `2026-08-15 05:20:17`），允许分隔符附近出现空白，校验日期合法性；不替换 `O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
 - 无有效时间，或出现多个不同的有效时间，返回 `None`。相同时间重复出现仍返回一个结果。
-- HTTP、网络、远端任务失败或响应格式异常抛 `OCRServiceError`。超时抛内置 `TimeoutError`。参数错误抛 `ValueError`，图片解码错误可抛 Pillow 的 `OSError`。
+- HTTP、网络、远端任务失败或响应格式异常抛 `OCRServiceError`；服务端限流（HTTP 429）抛其子类 `OCRRateLimitedError`，按 `OCRServiceError` 捕获仍然生效，库不因此自动重试。超时抛内置 `TimeoutError`。参数错误抛 `ValueError`，图片解码错误可抛 Pillow 的 `OSError`。
 - 10 秒覆盖图片准备、等待空闲 Token、提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。每 0.5 秒轮询，任务只提交一次，不自动重试。
 - 最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用排队，先到先得，谁先空闲用谁；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，失败也不换 Token 重试。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
 - 调用方取消会继续传播 `asyncio.CancelledError`。本地超时或取消不代表服务端任务已取消；图片处理线程也可能在后台完成，但不会继续发起 OCR 请求。

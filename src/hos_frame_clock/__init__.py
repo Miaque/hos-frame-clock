@@ -7,6 +7,7 @@ from io import BytesIO
 import json
 import math
 import re
+from time import monotonic
 from urllib.parse import quote
 
 import httpx
@@ -14,7 +15,7 @@ from PIL import Image
 
 from . import config
 
-__all__ = ["FrameTime", "OCRServiceError", "recognize_frame"]
+__all__ = ["FrameTime", "OCRRateLimitedError", "OCRServiceError", "recognize_frame"]
 
 
 _JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
@@ -35,6 +36,10 @@ class FrameTime:
 
 class OCRServiceError(RuntimeError):
     """OCR 请求失败、远端任务失败或响应不符合契约。"""
+
+
+class OCRRateLimitedError(OCRServiceError):
+    """服务端限流（HTTP 429）。调用方应降低并发或退避后自行重试。"""
 
 
 def _crop(
@@ -92,6 +97,22 @@ def _parse_result(content: str) -> FrameTime | None:
     return None
 
 
+def _detail(phase: str, queued: float | None) -> str:
+    """失败定位信息：出错阶段，以及排队等待 Token 的秒数。"""
+    if queued is None:
+        return f"阶段 {phase}，未取得 Token"
+    return f"阶段 {phase}，排队 {queued:.2f} 秒"
+
+
+def _failure_payload(data: dict) -> str:
+    """任务失败时的远端状态原文，去掉可能带签名的结果地址。"""
+    text = json.dumps(
+        {key: value for key, value in data.items() if key != "resultUrl"},
+        ensure_ascii=False, default=str,
+    )
+    return text if len(text) <= 300 else f"{text[:300]}…"
+
+
 def _job_data(response: httpx.Response) -> dict:
     try:
         data = response.json()["data"]
@@ -116,6 +137,7 @@ async def recognize_frame(
     个在途请求，全部占用时排队等待空闲 Token。
     ``timeout`` 覆盖图片准备、排队等待、任务提交、轮询和结果获取。
     超时抛出 ``TimeoutError``，服务失败抛出 ``OCRServiceError``，
+    其中服务端限流抛出其子类 ``OCRRateLimitedError``，本库不因此自动重试。
     无效图片抛出参数校验异常或 Pillow 异常。
     调用方取消继续向上传播。凭据仅发送到任务端点。
     """
@@ -123,14 +145,19 @@ async def recognize_frame(
         raise ValueError("image_bytes 必须为非空的 JPEG/PNG 编码字节")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout 必须为有限正数")
+    phase, queued = "准备图片", None
     try:
         async with asyncio.timeout(timeout):
             crop = await asyncio.to_thread(_crop, image_bytes, crop_box)
+            phase = "等待空闲 Token"
+            leased_at = monotonic()
             async with (
                 config.settings.lease_token() as token,
                 httpx.AsyncClient(timeout=timeout) as client,
             ):
+                queued = monotonic() - leased_at
                 headers = {"Authorization": f"bearer {token}"}
+                phase = "提交任务"
                 response = await client.post(
                     job_url,
                     headers=headers,
@@ -147,8 +174,9 @@ async def recognize_frame(
                 response.raise_for_status()
                 job_id = _job_data(response).get("jobId")
                 if not isinstance(job_id, str) or not job_id:
-                    raise OCRServiceError("缺少 OCR 任务 ID")
+                    raise OCRServiceError(f"缺少 OCR 任务 ID（{_detail(phase, queued)}）")
                 while True:
+                    phase = "查询任务状态"
                     response = await client.get(
                         f"{job_url.rstrip('/')}/{quote(job_id, safe='')}", headers=headers
                     )
@@ -159,16 +187,36 @@ async def recognize_frame(
                         result_url = data.get("resultUrl")
                         url = result_url.get("jsonUrl") if isinstance(result_url, dict) else None
                         if not isinstance(url, str) or not url.startswith("https://"):
-                            raise OCRServiceError("OCR 结果 URL 缺失或无效")
+                            raise OCRServiceError(
+                                f"OCR 结果 URL 缺失或无效（{_detail(phase, queued)}）"
+                            )
+                        phase = "下载识别结果"
                         response = await client.get(url, follow_redirects=True)
                         response.raise_for_status()
+                        phase = "解析识别结果"
                         return await asyncio.to_thread(_parse_result, response.text)
                     if state == "failed":
-                        raise OCRServiceError("OCR 任务失败")
+                        raise OCRServiceError(
+                            f"OCR 任务失败（{_detail(phase, queued)}）：{_failure_payload(data)}"
+                        )
                     if state not in ("pending", "running"):
-                        raise OCRServiceError("未知的 OCR 任务状态")
+                        raise OCRServiceError(
+                            f"未知的 OCR 任务状态 {state!r}（{_detail(phase, queued)}）"
+                        )
+                    phase = "等待轮询间隔"
                     await asyncio.sleep(0.5)
-    except httpx.TimeoutException as exc:
-        raise TimeoutError("OCR 识别超时") from exc
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise TimeoutError(f"OCR 识别超时（{_detail(phase, queued)}）") from exc
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 429:
+            raise OCRRateLimitedError(
+                f"OCR 服务端限流：HTTP 429（{_detail(phase, queued)}）"
+            ) from exc
+        raise OCRServiceError(
+            f"OCR HTTP 请求失败：HTTP {status}（{_detail(phase, queued)}）"
+        ) from exc
     except httpx.HTTPError as exc:
-        raise OCRServiceError("OCR HTTP 请求失败") from exc
+        raise OCRServiceError(
+            f"OCR HTTP 请求失败：{type(exc).__name__}（{_detail(phase, queued)}）"
+        ) from exc

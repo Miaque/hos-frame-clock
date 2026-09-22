@@ -15,3 +15,5 @@ wheels/
 !.env.example
 .history/
 examples/tmp/
+
+images/
