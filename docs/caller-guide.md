@@ -1,6 +1,6 @@
 # hos-frame-clock 调用方使用文档
 
-适用版本：`0.4.1`。运行环境：Python ≥3.12、asyncio。
+适用版本：`0.5.0`。运行环境：Python ≥3.12、asyncio。
 
 本库识别视频单帧右上角显示的完整日期时间。调用方负责抽帧，库负责裁剪、调用 PP-OCRv6、轮询及解析结果。无需部署 OCR 服务或安装本地模型，但运行环境需要能够访问 AI Studio 任务端点及其返回的结果下载地址。
 
@@ -9,7 +9,7 @@
 在调用项目目录执行：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.4.1"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.5.0"
 ```
 
 安装包名为 `hos-frame-clock`，Python 导入名为 `hos_frame_clock`。需要能访问内网 Nexus；如仓库要求认证，在调用方的包管理器中配置。安装和调用不需要 Maven 配置，Maven 凭据仅用于本库的发布脚本。

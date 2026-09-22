@@ -2,6 +2,8 @@
 
 ## 未发布
 
+## 0.5.0（2026-09-22）
+
 ### 新增
 
 - 服务端限流（HTTP 429）抛出新异常 `OCRRateLimitedError`，它是 `OCRServiceError` 的子类，既有按 `OCRServiceError` 捕获的调用方不受影响。库仍不自动重试，调用方据此降低并发或退避后自行重试；同时捕获两者时须把 `OCRRateLimitedError` 排在前面。

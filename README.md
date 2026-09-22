@@ -74,7 +74,7 @@ uv run python scripts/publish.py
 依赖项目通过 Nexus 安装固定版本（认证由本机或 CI 的包管理器配置提供；其他公共依赖仍由 uv 默认索引提供，如需统一走 Nexus，应改为管理员提供的 group 索引）：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.4.1"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.5.0"
 ```
 
 每次发布先更新 `pyproject.toml` 的版本，并使用对应版本的构建产物路径。构建产物位于 `dist/`。本仓库不包含凭据。
