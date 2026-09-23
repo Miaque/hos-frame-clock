@@ -1,16 +1,25 @@
 """通过 AI Studio PP-OCRv6 识别单路摄像头画面的日期时间。"""
 
 import asyncio
+import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-import json
-import math
-import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import monotonic
-from urllib.parse import quote
 
-import httpx
+from aiohttp import ClientError
+from paddleocr import (
+    AsyncPaddleOCRClient,
+    Model,
+    OCROptions,
+    PaddleOCRAPIError,
+    PollTimeoutError,
+    RateLimitError,
+    RequestTimeoutError,
+)
 from PIL import Image
 
 from . import config
@@ -65,32 +74,27 @@ def _crop(
             return output.getvalue()
 
 
-def _parse_result(content: str) -> FrameTime | None:
+def _parse_result(result) -> FrameTime | None:
     matches: dict[datetime, str] = {}
-    lines = [line for line in content.splitlines() if line.strip()]
-    if not lines:
-        raise OCRServiceError("OCR 结果文档为空")
     try:
-        for line in lines:
-            results = json.loads(line)["result"]["ocrResults"]
-            if not isinstance(results, list):
+        if not isinstance(result.pages, list):
+            raise TypeError
+        for page in result.pages:
+            texts = page.pruned_result["rec_texts"]
+            if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
                 raise TypeError
-            for result in results:
-                texts = result["prunedResult"]["rec_texts"]
-                if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
-                    raise TypeError
-                for match in _TIME.finditer("\n".join(texts)):
-                    try:
-                        timestamp = datetime(*(int(part) for part in match.groups()))
-                    except ValueError:
-                        continue
-                    raw_text = match.group()
-                    if match.end(3) == match.start(4):
-                        day_end = match.end(3) - match.start()
-                        raw_text = f"{raw_text[:day_end]} {raw_text[day_end:]}"
-                    matches.setdefault(timestamp, raw_text)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise OCRServiceError("OCR 结果文档格式无效") from exc
+            for match in _TIME.finditer("\n".join(texts)):
+                try:
+                    timestamp = datetime(*(int(part) for part in match.groups()))
+                except ValueError:
+                    continue
+                raw_text = match.group()
+                if match.end(3) == match.start(4):
+                    day_end = match.end(3) - match.start()
+                    raw_text = f"{raw_text[:day_end]} {raw_text[day_end:]}"
+                matches.setdefault(timestamp, raw_text)
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise OCRServiceError("OCR 结果格式无效") from exc
     if len(matches) == 1:
         timestamp, raw_text = next(iter(matches.items()))
         return FrameTime(timestamp, raw_text)
@@ -102,25 +106,6 @@ def _detail(phase: str, queued: float | None) -> str:
     if queued is None:
         return f"阶段 {phase}，未取得 Token"
     return f"阶段 {phase}，排队 {queued:.2f} 秒"
-
-
-def _failure_payload(data: dict) -> str:
-    """任务失败时的远端状态原文，去掉可能带签名的结果地址。"""
-    text = json.dumps(
-        {key: value for key, value in data.items() if key != "resultUrl"},
-        ensure_ascii=False, default=str,
-    )
-    return text if len(text) <= 300 else f"{text[:300]}…"
-
-
-def _job_data(response: httpx.Response) -> dict:
-    try:
-        data = response.json()["data"]
-        if not isinstance(data, dict):
-            raise TypeError
-        return data
-    except (KeyError, TypeError, ValueError) as exc:
-        raise OCRServiceError("OCR 任务响应格式无效") from exc
 
 
 async def recognize_frame(
@@ -139,84 +124,55 @@ async def recognize_frame(
     超时抛出 ``TimeoutError``，服务失败抛出 ``OCRServiceError``，
     其中服务端限流抛出其子类 ``OCRRateLimitedError``，本库不因此自动重试。
     无效图片抛出参数校验异常或 Pillow 异常。
-    调用方取消继续向上传播。凭据仅发送到任务端点。
+    调用方取消继续向上传播。裁剪图写入临时文件供官方 SDK 上传，调用结束后删除。
     """
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise ValueError("image_bytes 必须为非空的 JPEG/PNG 编码字节")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout 必须为有限正数")
+    api_path = "/api/v2/ocr/jobs"
+    if not job_url.rstrip("/").endswith(api_path):
+        raise ValueError("job_url 必须以 /api/v2/ocr/jobs 结尾")
+    base_url = job_url.rstrip("/")[:-len(api_path)]
+    deadline = monotonic() + timeout
     phase, queued = "准备图片", None
     try:
         async with asyncio.timeout(timeout):
             crop = await asyncio.to_thread(_crop, image_bytes, crop_box)
-            phase = "等待空闲 Token"
-            leased_at = monotonic()
-            async with (
-                config.settings.lease_token() as token,
-                httpx.AsyncClient(timeout=timeout) as client,
-            ):
-                queued = monotonic() - leased_at
-                headers = {"Authorization": f"bearer {token}"}
-                phase = "提交任务"
-                response = await client.post(
-                    job_url,
-                    headers=headers,
-                    data={
-                        "model": "PP-OCRv6",
-                        "optionalPayload": json.dumps({
-                            "useDocOrientationClassify": False,
-                            "useDocUnwarping": False,
-                            "useTextlineOrientation": False,
-                        }),
-                    },
-                    files={"file": ("frame.png", crop, "image/png")},
-                )
-                response.raise_for_status()
-                job_id = _job_data(response).get("jobId")
-                if not isinstance(job_id, str) or not job_id:
-                    raise OCRServiceError(f"缺少 OCR 任务 ID（{_detail(phase, queued)}）")
-                while True:
-                    phase = "查询任务状态"
-                    response = await client.get(
-                        f"{job_url.rstrip('/')}/{quote(job_id, safe='')}", headers=headers
-                    )
-                    response.raise_for_status()
-                    data = _job_data(response)
-                    state = data.get("state")
-                    if state == "done":
-                        result_url = data.get("resultUrl")
-                        url = result_url.get("jsonUrl") if isinstance(result_url, dict) else None
-                        if not isinstance(url, str) or not url.startswith("https://"):
-                            raise OCRServiceError(
-                                f"OCR 结果 URL 缺失或无效（{_detail(phase, queued)}）"
-                            )
-                        phase = "下载识别结果"
-                        response = await client.get(url, follow_redirects=True)
-                        response.raise_for_status()
-                        phase = "解析识别结果"
-                        return await asyncio.to_thread(_parse_result, response.text)
-                    if state == "failed":
-                        raise OCRServiceError(
-                            f"OCR 任务失败（{_detail(phase, queued)}）：{_failure_payload(data)}"
+            with TemporaryDirectory() as directory:
+                phase = "写入临时图片"
+                path = Path(directory) / "frame.png"
+                path.write_bytes(crop)
+                if monotonic() >= deadline:
+                    raise TimeoutError
+                phase = "等待空闲 Token"
+                leased_at = monotonic()
+                async with config.settings.lease_token() as token:
+                    queued = monotonic() - leased_at
+                    phase = "识别任务"
+                    async with AsyncPaddleOCRClient(
+                        token=token, base_url=base_url,
+                        request_timeout=timeout, poll_timeout=timeout,
+                    ) as client:
+                        result = await client.ocr(
+                            file_path=str(path), model=Model.PP_OCRV6,
+                            options=OCROptions(
+                                use_doc_orientation_classify=False,
+                                use_doc_unwarping=False,
+                                use_textline_orientation=False,
+                            ),
                         )
-                    if state not in ("pending", "running"):
-                        raise OCRServiceError(
-                            f"未知的 OCR 任务状态 {state!r}（{_detail(phase, queued)}）"
-                        )
-                    phase = "等待轮询间隔"
-                    await asyncio.sleep(0.5)
-    except (TimeoutError, httpx.TimeoutException) as exc:
+                    phase = "解析识别结果"
+                    return _parse_result(result)
+    except (TimeoutError, RequestTimeoutError, PollTimeoutError) as exc:
         raise TimeoutError(f"OCR 识别超时（{_detail(phase, queued)}）") from exc
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        if status == 429:
-            raise OCRRateLimitedError(
-                f"OCR 服务端限流：HTTP 429（{_detail(phase, queued)}）"
-            ) from exc
+    except RateLimitError as exc:
+        raise OCRRateLimitedError(f"OCR 服务端限流（{_detail(phase, queued)}）") from exc
+    except PaddleOCRAPIError as exc:
         raise OCRServiceError(
-            f"OCR HTTP 请求失败：HTTP {status}（{_detail(phase, queued)}）"
+            f"OCR 服务调用失败：{type(exc).__name__}（{_detail(phase, queued)}）"
         ) from exc
-    except httpx.HTTPError as exc:
+    except ClientError as exc:
         raise OCRServiceError(
-            f"OCR HTTP 请求失败：{type(exc).__name__}（{_detail(phase, queued)}）"
+            f"OCR 网络请求失败：{type(exc).__name__}（{_detail(phase, queued)}）"
         ) from exc

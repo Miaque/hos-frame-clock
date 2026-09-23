@@ -36,7 +36,7 @@ async def main():
 asyncio.run(main())
 ```
 
-运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。环境配置使用 `pydantic-settings` 的全局实例管理，在首次导入库时加载一次；请在导入前设置环境变量并确定工作目录，后续环境变量或 `.env` 修改需重启进程生效。`PADDLEOCR_TOKENS` 为 JSON 数组（如 `["token1","token2"]`），每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN`（默认 1）个在途请求，所有 Token 都占满时新调用排队等待最先空闲的 Token，等待时间计入 `timeout`。配置优先级为进程环境变量、当前工作目录的 `.env`；Token 不能通过参数传入。使用 UTF-8 编码，忽略 `.env` 中其他应用的配置项；空数组或取到空 Token 会报 `ValueError`，不向低优先级配置回退；`PADDLEOCR_TOKENS` 不是合法 JSON 数组时，在首次导入阶段抛出 `pydantic_settings.SettingsError`，`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。仅读取配置，不修改进程环境变量；不写文件、不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`；可通过 `crop_box` 指定识别区域。
+运行于 asyncio；已有异步应用直接 `await recognize_frame(...)`。环境配置使用 `pydantic-settings` 的全局实例管理，在首次导入库时加载一次；请在导入前设置环境变量并确定工作目录，后续环境变量或 `.env` 修改需重启进程生效。`PADDLEOCR_TOKENS` 为 JSON 数组（如 `["token1","token2"]`），每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN`（默认 1）个在途请求，所有 Token 都占满时新调用排队等待最先空闲的 Token，等待时间计入 `timeout`。配置优先级为进程环境变量、当前工作目录的 `.env`；Token 不能通过参数传入。使用 UTF-8 编码，忽略 `.env` 中其他应用的配置项；空数组或取到空 Token 会报 `ValueError`，不向低优先级配置回退；`PADDLEOCR_TOKENS` 不是合法 JSON 数组时，在首次导入阶段抛出 `pydantic_settings.SettingsError`，`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。仅读取配置，不修改进程环境变量；调用期间会将裁剪后的 PNG 写入系统临时目录供官方 SDK 上传，并在调用结束时删除；不打印日志。可通过 `job_url` 覆盖 AI Studio 任务端点，地址须以 `/api/v2/ocr/jobs` 结尾，默认是 `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`；可通过 `crop_box` 指定识别区域。
 
 ## 契约
 
@@ -47,7 +47,7 @@ asyncio.run(main())
 - 接受 `YYYY-MM-DD HH:MM:SS`；OCR 将日期与时间之间的空格识别为 `-`、`.`、`:` 或省略空格时，也按完整时间解析。时分之间的 `.` 可作为分隔符；保留匹配到的 OCR 原文，只有日期与时间紧邻时在 `raw_text` 中补一个空格。校验日期合法性；不猜测修正多出的数字、`O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
 - 无有效时间，或出现多个不同的有效时间，返回 `None`。相同时间重复出现仍返回一个结果。
 - HTTP、网络、远端任务失败或响应格式异常抛 `OCRServiceError`；服务端限流（HTTP 429）抛其子类 `OCRRateLimitedError`，按 `OCRServiceError` 捕获仍然生效，库不因此自动重试。超时抛内置 `TimeoutError`。参数错误抛 `ValueError`，图片解码错误可抛 Pillow 的 `OSError`。
-- 10 秒覆盖图片准备、等待空闲 Token、提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。每 0.5 秒轮询，任务只提交一次，不自动重试。
+- 10 秒覆盖图片准备、临时文件写入、等待空闲 Token、SDK 提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。调用一次 SDK 的 `ocr()`，直接等待并解析任务结果；轮询由 SDK 负责，任务只提交一次，不自动重试。
 - 最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用排队，先到先得，谁先空闲用谁；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，失败也不换 Token 重试。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
 - 调用方取消会继续传播 `asyncio.CancelledError`。本地超时或取消不代表服务端任务已取消；图片处理线程也可能在后台完成，但不会继续发起 OCR 请求。
 
@@ -59,7 +59,7 @@ uv run python -m unittest discover -s tests -v
 uv build
 ```
 
-测试使用真实图片编码和 HTTP 模拟响应，不会访问 OCR 服务。真实验收时设置 `PADDLEOCR_TOKENS`，按上面的示例读取实际帧；应确认返回样图时间且耗时符合要求。服务真实排队耗时不由本模块保证。
+测试使用真实图片编码和 SDK 模拟结果，不会访问 OCR 服务。真实验收时设置 `PADDLEOCR_TOKENS`，按上面的示例读取实际帧；应确认返回样图时间且耗时符合要求。服务真实排队耗时不由本模块保证。
 
 ## Nexus 发布与安装
 
@@ -83,6 +83,6 @@ uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-fram
 
 - [AI Studio OCR 文档](https://ai.baidu.com/ai-doc/AISTUDIO/Kmfl2ycs0)：OCR 结果中的 `prunedResult`。
 - [PaddleOCR 官方 API 客户端测试](https://github.com/PaddlePaddle/PaddleOCR/blob/main/tests/api_client/test_core.py)：任务结果 JSONL 的 `result.ocrResults[].prunedResult.rec_texts` 结构。
-- 任务提交、状态与结果下载协议依据用户提供的 PP-OCRv6 `/api/v2/ocr/jobs` 示例；真实服务验收另行进行。
+- [PaddleOCR 官方 API Python SDK](https://www.paddleocr.ai/latest/version3.x/inference_deployment/serving/paddleocr_official_api/python.html)：使用 `AsyncPaddleOCRClient.ocr(file_path=..., model=Model.PP_OCRV6)` 一次调用取得完成后的结果。真实服务验收另行进行。
 
 放大对照实验见 [OCR 放大实验记录](docs/ocr-scale-experiment.md)。

@@ -1,24 +1,33 @@
 import asyncio
-from datetime import datetime
-from email.parser import BytesParser
-from email.policy import default
-from functools import partial
-from io import BytesIO
-import json
-from importlib import reload
 import os
+import unittest
+from datetime import datetime
+from importlib import reload
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-import httpx
+from aiohttp import ClientConnectionError
+from paddleocr import (
+    AsyncPaddleOCRClient,
+    AuthError,
+    Model,
+    PollTimeoutError,
+    RateLimitError,
+    RequestTimeoutError,
+)
 from PIL import Image
 from pydantic import ValidationError
 from pydantic_settings import SettingsError
 
-from hos_frame_clock import OCRRateLimitedError, OCRServiceError, recognize_frame
-from hos_frame_clock import config
+from hos_frame_clock import (
+    OCRRateLimitedError,
+    OCRServiceError,
+    config,
+    recognize_frame,
+)
 
 
 def frame_bytes():
@@ -29,10 +38,34 @@ def frame_bytes():
     return output.getvalue()
 
 
+def ocr_result(texts):
+    return SimpleNamespace(pages=[SimpleNamespace(pruned_result={"rec_texts": texts})])
+
+
 def use_tokens(*tokens, concurrency=1):
     return patch.object(config, 'settings', config.Settings(
         PADDLEOCR_TOKENS=list(tokens), PADDLEOCR_CONCURRENCY_PER_TOKEN=concurrency,
     ))
+
+
+def sdk_patch(handler):
+    class FakeClient:
+        def __init__(self, *, token, base_url, request_timeout, poll_timeout):
+            self.token = token
+            self.base_url = base_url
+            self.request_timeout = request_timeout
+            self.poll_timeout = poll_timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def ocr(self, **kwargs):
+            return await handler(self, **kwargs)
+
+    return patch("hos_frame_clock.AsyncPaddleOCRClient", FakeClient)
 
 
 class RecognitionTests(unittest.IsolatedAsyncioTestCase):
@@ -56,11 +89,10 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                     ({}, 'local-token'),
                     ({'PADDLEOCR_TOKENS': '["env-token"]'}, 'env-token'),
                 ):
-                    async def handler(request):
-                        self.assertEqual(request.headers['Authorization'], f'bearer {expected}')
-                        return httpx.Response(401)
-                    client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-                    with patch.dict(os.environ, environment, clear=True), patch('httpx.AsyncClient', client):
+                    async def handler(client, expected=expected, **_):
+                        self.assertEqual(client.token, expected)
+                        raise AuthError("认证失败")
+                    with patch.dict(os.environ, environment, clear=True), sdk_patch(handler):
                         reload(config)
                         with self.assertRaises(OCRServiceError):
                             await recognize_frame(frame_bytes())
@@ -99,33 +131,22 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_configuration_is_loaded_once(self):
         with patch.object(config, 'settings', config.Settings(PADDLEOCR_TOKENS=['initial-token'])):
-            async def handler(request):
-                self.assertEqual(request.headers['Authorization'], 'bearer initial-token')
-                return httpx.Response(401)
+            async def handler(client, **_):
+                self.assertEqual(client.token, 'initial-token')
+                raise AuthError("认证失败")
 
-            client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-            with patch.dict(os.environ, {'PADDLEOCR_TOKENS': '["changed-token"]'}), patch('httpx.AsyncClient', client):
+            with patch.dict(os.environ, {'PADDLEOCR_TOKENS': '["changed-token"]'}), sdk_patch(handler):
                 for _ in range(2):
                     with self.assertRaises(OCRServiceError):
                         await recognize_frame(frame_bytes())
 
     def gated_service(self, started, gate):
-        async def handler(request):
-            if request.method == "POST":
-                started.append(request.headers["Authorization"])
-                await gate.wait()
-                return httpx.Response(200, json={"data": {"jobId": "job-1"}})
-            if request.url.host == "result.test":
-                return httpx.Response(200, text=json.dumps({"result": {"ocrResults": [
-                    {"prunedResult": {"rec_texts": ["2026-09-14 05:25:36"]}}
-                ]}}))
-            return httpx.Response(200, json={"data": {
-                "state": "done", "resultUrl": {"jsonUrl": "https://result.test/data"}
-            }})
+        async def handler(client, **_):
+            started.append(client.token)
+            await gate.wait()
+            return ocr_result(["2026-09-14 05:25:36"])
 
-        return patch("httpx.AsyncClient", partial(
-            httpx.AsyncClient, transport=httpx.MockTransport(handler)
-        ))
+        return sdk_patch(handler)
 
     async def test_calls_wait_for_a_free_token(self):
         for tokens, concurrency, calls in (
@@ -137,7 +158,7 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                 with use_tokens(*tokens, concurrency=concurrency), self.gated_service(started, gate):
                     tasks = [asyncio.create_task(recognize_frame(frame_bytes())) for _ in range(calls)]
                     await asyncio.sleep(0.2)
-                    self.assertEqual(sorted(started), sorted(f"bearer {t}" for t in tokens * concurrency))
+                    self.assertEqual(sorted(started), sorted(tokens * concurrency))
                     gate.set()
                     results = await asyncio.gather(*tasks)
                 self.assertEqual(len(started), calls)
@@ -152,85 +173,102 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
                 await recognize_frame(frame_bytes(), timeout=0.15)
             gate.set()
             self.assertIsNotNone(await first)
-        self.assertEqual(started, ["bearer token-a"])
+        self.assertEqual(started, ["token-a"])
 
     async def test_token_is_released_after_failure(self):
-        statuses = iter([401, 200])
+        calls = 0
 
-        async def handler(request):
-            if request.method == "POST":
-                return httpx.Response(next(statuses), json={"data": {"jobId": "job-1"}})
-            if request.url.host == "result.test":
-                return httpx.Response(200, text=json.dumps({"result": {"ocrResults": [
-                    {"prunedResult": {"rec_texts": ["2026-09-14 05:25:36"]}}
-                ]}}))
-            return httpx.Response(200, json={"data": {
-                "state": "done", "resultUrl": {"jsonUrl": "https://result.test/data"}
-            }})
+        async def handler(client, **_):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise AuthError("认证失败")
+            return ocr_result(["2026-09-14 05:25:36"])
 
-        client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-        with use_tokens('token-a'), patch("httpx.AsyncClient", client):
+        with use_tokens('token-a'), sdk_patch(handler):
             with self.assertRaises(OCRServiceError):
                 await recognize_frame(frame_bytes())
             self.assertIsNotNone(await recognize_frame(frame_bytes(), timeout=1))
 
-    async def test_crops_uploads_and_returns_datetime_and_original_text(self):
+    async def test_sdk_receives_crop_and_returns_result_directly(self):
         expected_size = (936, 195)
+        paths = []
 
-        async def handler(request):
-            if request.method == "POST":
-                self.assertEqual(request.headers["Authorization"], "bearer test-token")
-                message = BytesParser(policy=default).parsebytes(
-                    b"Content-Type: " + request.headers["Content-Type"].encode()
-                    + b"\r\n\r\n" + await request.aread()
-                )
-                parts = {part.get_param("name", header="content-disposition"): part
-                         for part in message.iter_parts()}
-                self.assertEqual(parts["model"].get_payload(decode=True), b"PP-OCRv6")
-                with Image.open(BytesIO(parts["file"].get_payload(decode=True))) as crop:
-                    self.assertEqual(crop.size, expected_size)
-                    if expected_size == (936, 195):
-                        self.assertEqual(crop.getpixel((0, 0)), (255, 0, 0))
-                        self.assertEqual(crop.getpixel((935, 194)), (255, 0, 0))
-                return httpx.Response(200, json={"data": {"jobId": "job-1"}})
-            if request.url.host == "result.test":
-                self.assertNotIn("Authorization", request.headers)
-                return httpx.Response(200, text=json.dumps({"result": {"ocrResults": [
-                    {"prunedResult": {"rec_texts": ["2026-09-14 05:25:36"]}}
-                ]}}))
-            return httpx.Response(200, json={"data": {
-                "state": "done", "resultUrl": {"jsonUrl": "https://result.test/data"}
-            }})
+        async def handler(client, *, file_path, model, options):
+            self.assertEqual(client.token, "test-token")
+            self.assertEqual(client.base_url, "https://paddleocr.aistudio-app.com")
+            self.assertEqual(client.request_timeout, 10)
+            self.assertEqual(client.poll_timeout, 10)
+            self.assertEqual(model, Model.PP_OCRV6)
+            self.assertFalse(options.use_doc_orientation_classify)
+            self.assertFalse(options.use_doc_unwarping)
+            self.assertFalse(options.use_textline_orientation)
+            paths.append(Path(file_path))
+            with Image.open(file_path) as crop:
+                self.assertEqual(crop.format, "PNG")
+                self.assertEqual(crop.size, expected_size)
+                if expected_size == (936, 195):
+                    self.assertEqual(crop.getpixel((0, 0)), (255, 0, 0))
+                    self.assertEqual(crop.getpixel((935, 194)), (255, 0, 0))
+            return ocr_result(["2026-09-14 05:25:36"])
 
-        client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-        with patch("httpx.AsyncClient", client):
+        with sdk_patch(handler):
             result = await recognize_frame(frame_bytes())
             self.assertEqual(result.timestamp, datetime(2026, 9, 14, 5, 25, 36))
             self.assertEqual(result.raw_text, "2026-09-14 05:25:36")
             expected_size = (2592, 804)
             self.assertIsNotNone(await recognize_frame(frame_bytes(), crop_box=(0.5, 0.5, 1, 1)))
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(all(not path.exists() for path in paths))
 
-    async def run_service(self, *, texts=None, content=None, state="done", status=200,
-                          delay_at=None, timeout=10):
-        async def handler(request):
-            phase = "submit" if request.method == "POST" else (
-                "download" if request.url.host == "result.test" else "poll"
-            )
-            if phase == delay_at:
-                await asyncio.sleep(1)
-            if phase == "submit":
-                return httpx.Response(status, json={"data": {"jobId": "job-1"}})
-            if phase == "poll":
-                return httpx.Response(200, json={"data": {
-                    "state": state, "resultUrl": {"jsonUrl": "https://result.test/data"}
-                }})
-            payload = content if content is not None else json.dumps({"result": {
-                "ocrResults": [{"prunedResult": {"rec_texts": texts}}]
-            }})
-            return httpx.Response(200, text=payload)
+    async def test_official_sdk_ocr_returns_parsed_pages(self):
+        async def submit_file(_client, model, file_path, optional_payload, **_):
+            self.assertEqual(model, "PP-OCRv6")
+            self.assertTrue(Path(file_path).is_file())
+            self.assertEqual(optional_payload["useTextlineOrientation"], False)
+            return "job-1"
 
-        client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-        with patch("httpx.AsyncClient", client):
+        jsonl = [{"result": {"ocrResults": [
+            {"prunedResult": {"rec_texts": ["2026-09-14 05:25:36"]}}
+        ]}}]
+        with (
+            patch("hos_frame_clock.AsyncPaddleOCRClient", AsyncPaddleOCRClient),
+            patch("paddleocr._api_client.async_client.AsyncHTTPClient.__aenter__", new_callable=AsyncMock),
+            patch("paddleocr._api_client.async_client.AsyncHTTPClient.close", new_callable=AsyncMock),
+            patch("paddleocr._api_client.async_client.AsyncHTTPClient.submit_file", submit_file),
+            patch("paddleocr._api_client.async_client.AsyncPoller.poll_until_done",
+                  new_callable=AsyncMock, return_value=(jsonl, {})) as poll,
+        ):
+            result = await recognize_frame(frame_bytes())
+        self.assertEqual(result.timestamp.isoformat(), "2026-09-14T05:25:36")
+        poll.assert_awaited_once_with("job-1")
+
+    async def test_temporary_file_is_removed_after_failure_and_timeout(self):
+        paths = []
+
+        async def handler(client, *, file_path, **_):
+            paths.append(Path(file_path))
+            if len(paths) == 1:
+                raise AuthError("认证失败")
+            await asyncio.sleep(1)
+
+        with sdk_patch(handler):
+            with self.assertRaises(OCRServiceError):
+                await recognize_frame(frame_bytes())
+            with self.assertRaises(TimeoutError):
+                await recognize_frame(frame_bytes(), timeout=0.15)
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(all(not path.exists() for path in paths))
+
+    async def run_service(self, *, texts=None, result=None, error=None, delay=0, timeout=10):
+        async def handler(client, **_):
+            if delay:
+                await asyncio.sleep(delay)
+            if error:
+                raise error
+            return result if result is not None else ocr_result(texts)
+
+        with sdk_patch(handler):
             return await recognize_frame(frame_bytes(), timeout=timeout)
 
     async def test_missing_invalid_and_ambiguous_times(self):
@@ -299,78 +337,45 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
         duplicate = await self.run_service(texts=["2026-09-14 05:25:36"] * 2)
         self.assertEqual(duplicate.timestamp, result.timestamp)
 
-    async def test_service_and_protocol_failures_are_not_no_match(self):
-        for kwargs in ({"status": 401}, {"status": 503}, {"state": "failed"},
-                       {"state": "unexpected"}, {"content": ""},
-                       {"content": "not json"}, {"content": "{}"},
-                       {"texts": "2026-09-14 05:25:36"}):
-            with self.subTest(kwargs=kwargs), self.assertRaises(OCRServiceError):
-                await self.run_service(**kwargs)
+    async def test_sdk_failures_and_invalid_results_are_not_no_match(self):
+        for error in (AuthError("认证失败"), ClientConnectionError("连接失败"),
+                      RequestTimeoutError("请求超时"), PollTimeoutError("job-1", 10),
+                      RateLimitError("限流")):
+            with self.subTest(error=type(error).__name__):
+                expected = TimeoutError if isinstance(error, (RequestTimeoutError, PollTimeoutError)) else OCRServiceError
+                with self.assertRaises(expected):
+                    await self.run_service(error=error)
+        for result in (SimpleNamespace(pages=None),
+                       SimpleNamespace(pages=[SimpleNamespace(pruned_result={})]),
+                       ocr_result("2026-09-14 05:25:36")):
+            with self.subTest(result=result), self.assertRaises(OCRServiceError):
+                await self.run_service(result=result)
 
     async def test_rate_limiting_raises_a_distinguishable_error(self):
         with self.assertRaises(OCRRateLimitedError) as limited:
-            await self.run_service(status=429)
+            await self.run_service(error=RateLimitError("限流"))
         self.assertIsInstance(limited.exception, OCRServiceError)
         with self.assertRaises(OCRServiceError) as other:
-            await self.run_service(status=503)
+            await self.run_service(error=AuthError("认证失败"))
         self.assertNotIsInstance(other.exception, OCRRateLimitedError)
 
-    async def test_timeout_covers_every_network_stage_and_poll_wait(self):
-        for phase in ("submit", "poll", "download", None):
-            with self.subTest(phase=phase), self.assertRaises(TimeoutError):
-                await self.run_service(delay_at=phase, timeout=0.15,
-                                       state="pending" if phase is None else "done")
-
-    async def test_caller_cancellation_propagates(self):
-        task = asyncio.create_task(self.run_service(delay_at="submit"))
+    async def test_total_timeout_and_cancellation(self):
+        with self.assertRaises(TimeoutError):
+            await self.run_service(delay=1, timeout=0.15)
+        task = asyncio.create_task(self.run_service(delay=1))
         await asyncio.sleep(0.05)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
 
-    async def test_total_deadline_is_not_reset_between_requests(self):
-        phases = []
-
-        async def handler(request):
-            phases.append(request.method)
-            await asyncio.sleep(0.11)
-            if request.method == "POST":
-                return httpx.Response(200, json={"data": {"jobId": "job-1"}})
-            return httpx.Response(200, json={"data": {
-                "state": "done", "resultUrl": {"jsonUrl": "https://result.test/data"}
-            }})
-
-        client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-        with patch("httpx.AsyncClient", client), self.assertRaises(TimeoutError):
-            await recognize_frame(frame_bytes(), timeout=0.3)
-        self.assertEqual(phases, ["POST", "GET", "GET"])
-
-    async def test_pending_running_done_sequence(self):
-        states = iter(["pending", "running", "done"])
-
-        async def handler(request):
-            if request.method == "POST":
-                return httpx.Response(200, json={"data": {"jobId": "job-1"}})
-            if request.url.host == "result.test":
-                return httpx.Response(200, text=json.dumps({"result": {"ocrResults": [
-                    {"prunedResult": {"rec_texts": ["2024-02-29 23:59:59"]}}
-                ]}}))
-            return httpx.Response(200, json={"data": {
-                "state": next(states), "resultUrl": {"jsonUrl": "https://result.test/data"}
-            }})
-
-        client = partial(httpx.AsyncClient, transport=httpx.MockTransport(handler))
-        with patch("httpx.AsyncClient", client):
-            result = await recognize_frame(frame_bytes())
-        self.assertEqual(result.timestamp, datetime(2024, 2, 29, 23, 59, 59))
-
     async def test_invalid_input_does_not_call_service(self):
-        with patch("httpx.AsyncClient", side_effect=AssertionError("Unexpected network")):
+        with patch("hos_frame_clock.AsyncPaddleOCRClient", side_effect=AssertionError("不应调用 SDK")):
             for kwargs in ({"image_bytes": b""}, {"timeout": 0},
                            {"timeout": float("nan")}, {"timeout": float("inf")},
                            {"crop_box": (0.5, 0, 0.5, 1)}, {"crop_box": (0, 0.5, 1, 0.5)},
                            {"crop_box": (-0.1, 0, 1, 1)}, {"crop_box": (0, 0, 1.1, 1)},
-                           {"crop_box": (0, 0, float("nan"), 1)}, {"crop_box": (0, 0, 1)}):
+                           {"crop_box": (0, 0, float("nan"), 1)}, {"crop_box": (0, 0, 1)},
+                           {"job_url": "https://example.com/other"}):
                 arguments = {"image_bytes": frame_bytes(), **kwargs}
                 with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                     await recognize_frame(**arguments)
