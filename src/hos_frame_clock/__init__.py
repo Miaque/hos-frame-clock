@@ -1,6 +1,7 @@
-"""通过 AI Studio PP-OCRv6 识别单路摄像头画面的日期时间。"""
+"""通过 PP-OCRv6 识别单路摄像头画面的日期时间。"""
 
 import asyncio
+import base64
 import math
 import re
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
 
-from aiohttp import ClientError
+from aiohttp import ClientError, ClientSession, ClientTimeout
 from paddleocr import (
     AsyncPaddleOCRClient,
     Model,
@@ -74,13 +75,15 @@ def _crop(
             return output.getvalue()
 
 
-def _parse_result(result) -> FrameTime | None:
+def _parse_result(result, *, self_hosted: bool = False) -> FrameTime | None:
     matches: dict[datetime, str] = {}
     try:
-        if not isinstance(result.pages, list):
+        pages = result["result"]["ocrResults"] if self_hosted else result.pages
+        if not isinstance(pages, list):
             raise TypeError
-        for page in result.pages:
-            texts = page.pruned_result["rec_texts"]
+        for page in pages:
+            pruned = page["prunedResult"] if self_hosted else page.pruned_result
+            texts = pruned["rec_texts"]
             if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
                 raise TypeError
             for match in _TIME.finditer("\n".join(texts)):
@@ -104,8 +107,37 @@ def _parse_result(result) -> FrameTime | None:
 def _detail(phase: str, queued: float | None) -> str:
     """失败定位信息：出错阶段，以及排队等待 Token 的秒数。"""
     if queued is None:
-        return f"阶段 {phase}，未取得 Token"
+        return f"阶段 {phase}"
     return f"阶段 {phase}，排队 {queued:.2f} 秒"
+
+
+async def _self_hosted_ocr(crop: bytes, timeout: float) -> dict:
+    url = config.settings.self_hosted_url
+    if not url:
+        raise ValueError("自部署模式需要设置 PADDLEOCR_SELF_HOSTED_URL")
+    payload = {
+        "file": base64.b64encode(crop).decode("ascii"),
+        "fileType": 1,
+        "useDocOrientationClassify": False,
+        "useDocUnwarping": False,
+        "useTextlineOrientation": False,
+        "visualize": False,
+    }
+    async with (
+        ClientSession(timeout=ClientTimeout(total=timeout)) as client,
+        client.post(url, json=payload) as response,
+    ):
+        if response.status == 429:
+            raise OCRRateLimitedError("自部署 OCR 服务端限流：HTTP 429")
+        response.raise_for_status()
+        try:
+            result = await response.json()
+        except ValueError as exc:
+            raise OCRServiceError("自部署 OCR 响应不是有效 JSON") from exc
+    if not isinstance(result, dict) or result.get("errorCode") != 0:
+        code = result.get("errorCode") if isinstance(result, dict) else None
+        raise OCRServiceError(f"自部署 OCR 返回错误码 {code!r}")
+    return result
 
 
 async def recognize_frame(
@@ -118,27 +150,34 @@ async def recognize_frame(
     """识别单帧 JPEG/PNG 图片中识别区域的日期时间。
 
     ``crop_box`` 为识别区域相对帧宽高的比例 ``(left, top, right, bottom)``，默认右上角。
-    每个 ``PADDLEOCR_TOKENS`` 中的 Token 同时最多服务 ``PADDLEOCR_CONCURRENCY_PER_TOKEN``
-    个在途请求，全部占用时排队等待空闲 Token。
+    线上模式中，每个 ``PADDLEOCR_TOKENS`` 中的 Token 同时最多服务
+    ``PADDLEOCR_CONCURRENCY_PER_TOKEN`` 个在途请求，全部占用时排队等待空闲 Token。
     ``timeout`` 覆盖图片准备、排队等待、任务提交、轮询和结果获取。
     超时抛出 ``TimeoutError``，服务失败抛出 ``OCRServiceError``，
     其中服务端限流抛出其子类 ``OCRRateLimitedError``，本库不因此自动重试。
     无效图片抛出参数校验异常或 Pillow 异常。
-    调用方取消继续向上传播。裁剪图写入临时文件供官方 SDK 上传，调用结束后删除。
+    调用方取消继续向上传播。线上模式临时写入裁剪图供 SDK 上传，调用结束后删除。
+    自部署模式直接发送内存中的裁剪图。
     """
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise ValueError("image_bytes 必须为非空的 JPEG/PNG 编码字节")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout 必须为有限正数")
-    api_path = "/api/v2/ocr/jobs"
-    if not job_url.rstrip("/").endswith(api_path):
-        raise ValueError("job_url 必须以 /api/v2/ocr/jobs 结尾")
-    base_url = job_url.rstrip("/")[:-len(api_path)]
+    if config.settings.backend == "official":
+        api_path = "/api/v2/ocr/jobs"
+        if not job_url.rstrip("/").endswith(api_path):
+            raise ValueError("job_url 必须以 /api/v2/ocr/jobs 结尾")
+        base_url = job_url.rstrip("/")[:-len(api_path)]
     deadline = monotonic() + timeout
     phase, queued = "准备图片", None
     try:
         async with asyncio.timeout(timeout):
             crop = await asyncio.to_thread(_crop, image_bytes, crop_box)
+            if config.settings.backend == "self_hosted":
+                phase = "调用自部署 OCR"
+                result = await _self_hosted_ocr(crop, timeout)
+                phase = "解析识别结果"
+                return _parse_result(result, self_hosted=True)
             with TemporaryDirectory() as directory:
                 phase = "写入临时图片"
                 path = Path(directory) / "frame.png"

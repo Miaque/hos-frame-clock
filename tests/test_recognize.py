@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import unittest
 from datetime import datetime
@@ -9,7 +10,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from aiohttp import ClientConnectionError
+from aiohttp import ClientConnectionError, web
 from paddleocr import (
     AsyncPaddleOCRClient,
     AuthError,
@@ -48,6 +49,13 @@ def use_tokens(*tokens, concurrency=1):
     ))
 
 
+def use_self_hosted(url):
+    return patch.object(config, 'settings', config.Settings(
+        PADDLEOCR_BACKEND='self_hosted', PADDLEOCR_SELF_HOSTED_URL=url,
+        PADDLEOCR_TOKENS=[],
+    ))
+
+
 def sdk_patch(handler):
     class FakeClient:
         def __init__(self, *, token, base_url, request_timeout, poll_timeout):
@@ -71,6 +79,92 @@ def sdk_patch(handler):
 class RecognitionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(use_tokens('test-token'))
+
+    async def self_hosted_url(self, handler):
+        app = web.Application()
+        app.router.add_post('/ocr', handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        site = web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        return f'http://127.0.0.1:{port}/ocr'
+
+    async def test_self_hosted_backend_uses_same_public_call_without_tokens(self):
+        requests = []
+
+        async def handler(request):
+            payload = await request.json()
+            requests.append(payload)
+            return web.json_response({
+                'errorCode': 0,
+                'result': {'ocrResults': [
+                    {'prunedResult': {'rec_texts': ['2026-09-2112:31:36']}}
+                ]},
+            })
+
+        url = await self.self_hosted_url(handler)
+        with use_self_hosted(url), patch(
+            'hos_frame_clock.AsyncPaddleOCRClient',
+            side_effect=AssertionError('自部署模式不应调用官方 SDK'),
+        ):
+            result = await recognize_frame(frame_bytes())
+        self.assertEqual(result.timestamp.isoformat(), '2026-09-21T12:31:36')
+        self.assertEqual(result.raw_text, '2026-09-21 12:31:36')
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]['fileType'], 1)
+        self.assertFalse(requests[0]['useDocOrientationClassify'])
+        self.assertFalse(requests[0]['useDocUnwarping'])
+        self.assertFalse(requests[0]['useTextlineOrientation'])
+        self.assertFalse(requests[0]['visualize'])
+        with Image.open(BytesIO(base64.b64decode(requests[0]['file']))) as crop:
+            self.assertEqual(crop.format, 'PNG')
+            self.assertEqual(crop.size, (936, 195))
+
+    async def test_self_hosted_backend_reports_service_errors(self):
+        async def handler(request):
+            return web.json_response({'errorCode': 123, 'errorMsg': '识别失败'})
+
+        url = await self.self_hosted_url(handler)
+        with use_self_hosted(url), self.assertRaises(OCRServiceError):
+            await recognize_frame(frame_bytes())
+
+    async def test_self_hosted_backend_maps_http_and_response_failures(self):
+        mode = 'rate_limit'
+
+        async def handler(request):
+            if mode == 'rate_limit':
+                return web.Response(status=429)
+            if mode == 'invalid_json':
+                return web.Response(text='invalid', content_type='application/json')
+            return web.json_response({'errorCode': 0, 'result': {}})
+
+        url = await self.self_hosted_url(handler)
+        with use_self_hosted(url):
+            for mode, error in (
+                ('rate_limit', OCRRateLimitedError),
+                ('invalid_json', OCRServiceError),
+                ('invalid_result', OCRServiceError),
+            ):
+                with self.subTest(mode=mode), self.assertRaises(error):
+                    await recognize_frame(frame_bytes())
+
+    async def test_self_hosted_configuration_requires_url_but_not_tokens(self):
+        with patch.dict(os.environ, {
+            'PADDLEOCR_BACKEND': 'self_hosted',
+            'PADDLEOCR_SELF_HOSTED_URL': 'http://example.test/ocr',
+        }, clear=True):
+            settings = config.Settings()
+        self.assertEqual(settings.backend, 'self_hosted')
+        self.assertEqual(settings.tokens, [])
+        with (
+            patch.object(config, 'settings', config.Settings(PADDLEOCR_BACKEND='self_hosted')),
+            self.assertRaises(ValueError),
+        ):
+            await recognize_frame(frame_bytes())
+        with self.assertRaises(ValidationError):
+            config.Settings(PADDLEOCR_BACKEND='unknown')
 
     async def test_automatic_token_lookup_and_precedence(self):
         with TemporaryDirectory() as directory:

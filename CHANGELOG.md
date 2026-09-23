@@ -1,6 +1,10 @@
 # 更新记录
 
-## 未发布
+## 0.6.0（2026-09-23）
+
+### 新增
+
+- 新增 `PADDLEOCR_BACKEND=self_hosted` 与 `PADDLEOCR_SELF_HOSTED_URL`，通过环境配置切换自部署 `/ocr` 服务，保持 `recognize_frame` 的调用和返回值不变。自部署模式不需要 Token，也不使用线上 Token 队列。
 
 ## 0.5.0（2026-09-22）
 

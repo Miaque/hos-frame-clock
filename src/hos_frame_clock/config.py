@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import cached_property
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,6 +17,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    backend: Literal["official", "self_hosted"] = Field(
+        default="official", validation_alias="PADDLEOCR_BACKEND"
+    )
+    self_hosted_url: str = Field(
+        default="", validation_alias="PADDLEOCR_SELF_HOSTED_URL"
+    )
     tokens: list[str] = Field(
         default_factory=list, validation_alias="PADDLEOCR_TOKENS", repr=False
     )

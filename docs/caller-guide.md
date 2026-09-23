@@ -1,31 +1,41 @@
 # hos-frame-clock 调用方使用文档
 
-适用版本：`0.5.1`。运行环境：Python ≥3.12、asyncio。
+适用版本：`0.6.0`。运行环境：Python ≥3.12、asyncio。
 
-本库识别视频单帧右上角显示的完整日期时间。调用方负责抽帧，库负责裁剪，并通过官方 `AsyncPaddleOCRClient.ocr()` 提交 PP-OCRv6 任务、等待并解析结果。无需部署 OCR 服务或安装本地模型，但运行环境需要能够访问 AI Studio 任务端点及其返回的结果下载地址。
+本库识别视频单帧右上角显示的完整日期时间。调用方负责抽帧，库负责裁剪和解析结果；后端可选线上官方 API 或自部署 `/ocr` 服务。两种模式使用相同的 `recognize_frame` 调用和返回值。
 
 ## 1. 安装
 
 在调用项目目录执行：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.5.1"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.6.0"
 ```
 
 安装包名为 `hos-frame-clock`，Python 导入名为 `hos_frame_clock`。需要能访问内网 Nexus；如仓库要求认证，在调用方的包管理器中配置。安装和调用不需要 Maven 配置，Maven 凭据仅用于本库的发布脚本。
 
-## 2. 配置 OCR Token
+## 2. 选择 OCR 后端
 
 环境配置由 `pydantic-settings` 全局实例管理，在首次导入库时加载一次。请在导入前设置环境变量并确定工作目录；后续环境变量或 `.env` 修改需重启进程生效。使用 UTF-8 编码，忽略 `.env` 中其他应用的配置项。
 
-在**调用项目自己的 `.env`** 中填写真实 Token：
+线上官方 API 是默认模式。在**调用项目自己的 `.env`** 中配置：
 
 ```dotenv
+PADDLEOCR_BACKEND=official
 PADDLEOCR_TOKENS=["填写你的真实Token","可选的第二个Token"]
 PADDLEOCR_CONCURRENCY_PER_TOKEN=1
 ```
 
-`PADDLEOCR_TOKENS` 为 JSON 数组，至少填写一个 Token。只有一个时写成 `PADDLEOCR_TOKENS=["填写你的真实Token"]`。`PADDLEOCR_CONCURRENCY_PER_TOKEN` 为每个 Token 同时允许的在途请求数，≥1 的整数，可省略，默认 1。
+自部署服务改用以下配置，无需填写 Token：
+
+```dotenv
+PADDLEOCR_BACKEND=self_hosted
+PADDLEOCR_SELF_HOSTED_URL=http://你的OCR服务地址:7070/ocr
+```
+
+自部署模式向 URL 发送一次 JSON 请求：`file` 是裁剪放大后 PNG 的 base64，`fileType=1`，`useDocOrientationClassify`、`useDocUnwarping`、`useTextlineOrientation`、`visualize` 均为 `false`；成功响应要求 `errorCode=0`，从 `result.ocrResults[].prunedResult.rec_texts` 解析时间。参考[自部署服务验收任务](thread://01a0cd60-e7cf-7f23-9d09-4a9d85db31e2?hostId=local)。自部署模式不使用 `PADDLEOCR_TOKENS`、`PADDLEOCR_CONCURRENCY_PER_TOKEN` 或 `job_url`，也不在库内按 Token 排队。
+
+线上模式的 `PADDLEOCR_TOKENS` 为 JSON 数组，至少填写一个 Token。只有一个时写成 `PADDLEOCR_TOKENS=["填写你的真实Token"]`。`PADDLEOCR_CONCURRENCY_PER_TOKEN` 为每个 Token 同时允许的在途请求数，≥1 的整数，可省略，默认 1。
 
 在调用项目的 `.gitignore` 中添加：
 
@@ -39,9 +49,9 @@ PADDLEOCR_CONCURRENCY_PER_TOKEN=1
 uv run python main.py
 ```
 
-初始化配置时，库优先读取进程环境变量；不存在时，读取当前工作目录的 `.env`，不向父目录查找。调用方无需手动加载，也不能通过函数参数传入 Token。建议从调用项目根目录启动；不会按库的安装位置查找配置，也不会修改进程环境变量。部署时可直接注入同名环境变量。
+初始化配置时，库优先读取进程环境变量；不存在时，读取当前工作目录的 `.env`，不向父目录查找。调用方无需手动加载，也不能通过函数参数传入 Token。建议从调用项目根目录启动；不会按库的安装位置查找配置，也不会修改进程环境变量。部署时可直接注入同名环境变量；切换后端或 URL 后需重启进程。
 
-每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN` 个在途请求，最大并发为 Token 数乘以该值。三个 Token、默认值 1 时，第四个并发调用会等待最先空闲的 Token，等待时间计入 `timeout`，等不到抛 `TimeoutError`；调用结束（成功、失败、超时或取消）即归还 Token。不做可用性检查，某个 Token 失效或限流时不会自动换用其他 Token 重试，调用方需要自行处理 `OCRServiceError`（服务端限流为其子类 `OCRRateLimitedError`）并决定是否重试。空数组或取到空字符串报 `ValueError`；`PADDLEOCR_TOKENS` 不是合法 JSON 数组（例如写成 `PADDLEOCR_TOKENS=abc` 或留空）时，库在首次导入阶段抛出 `pydantic_settings.SettingsError`；`PADDLEOCR_CONCURRENCY_PER_TOKEN` 不是 ≥1 的整数时抛出 `pydantic.ValidationError`。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。
+线上模式每个 Token 同时最多服务 `PADDLEOCR_CONCURRENCY_PER_TOKEN` 个在途请求，最大并发为 Token 数乘以该值。三个 Token、默认值 1 时，第四个并发调用会等待最先空闲的 Token，等待时间计入 `timeout`，等不到抛 `TimeoutError`；调用结束即归还 Token。不做可用性检查，失效或限流后不会自动换 Token 重试。空数组或空 Token 报 `ValueError`；`PADDLEOCR_TOKENS` 不是合法 JSON 数组时，在首次导入阶段抛出 `pydantic_settings.SettingsError`；并发值不是 ≥1 的整数时抛出 `pydantic.ValidationError`。排队等待绑定首个需要等待的事件循环，同一进程多次 `asyncio.run()` 不受支持。`PADDLEOCR_BACKEND` 只能是 `official` 或 `self_hosted`，其他值在首次导入阶段抛出 `pydantic.ValidationError`；自部署模式未设置 URL 时抛 `ValueError`。
 
 ## 3. 完整调用示例
 
@@ -84,7 +94,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-样图成功输出的时间为 `2026-09-14 05:25:36`。缺少 Token 时库抛出 `ValueError`；本地图片不存在时，示例会在调用库之前报错。
+线上样图成功输出的时间为 `2026-09-14 05:25:36`。线上模式缺少 Token 时库抛出 `ValueError`；本地图片不存在时，示例会在调用库之前报错。
 
 已有异步服务、任务或事件循环时，在其异步函数内直接 `await recognize_frame(...)`，不要在运行中的事件循环里嵌套调用 `asyncio.run()`。
 
@@ -96,7 +106,7 @@ if __name__ == "__main__":
 | --- | --- | --- | --- |
 | `image_bytes` | `bytes` | 是 | 完整单帧图片的 JPEG/PNG 编码内容 |
 | `timeout` | `float` | 否 | 全过程超时秒数，默认 10，必须为有限正数 |
-| `job_url` | `str` | 否 | SDK 服务地址对应的任务端点，须以 `/api/v2/ocr/jobs` 结尾，一般无需修改 |
+| `job_url` | `str` | 否 | 仅线上模式使用，须以 `/api/v2/ocr/jobs` 结尾，一般无需修改 |
 | `crop_box` | `tuple[float, float, float, float]` | 否 | 识别区域 `(left, top, right, bottom)`，为帧宽高的比例，默认右上角 |
 
 默认任务地址：`https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`。
@@ -138,13 +148,15 @@ if __name__ == "__main__":
 
 ## 7. 超时与重试
 
-默认 10 秒覆盖图片准备、临时 PNG 写入、任务提交、轮询、结果下载和解析，不是每次 HTTP 请求分别获得 10 秒。调用前自行抽帧、下载原图、读取文件的时间不计入此期限。
+默认 10 秒覆盖图片准备及所选后端的请求和结果解析；线上模式还包括临时 PNG 写入、Token 排队、任务轮询和结果下载。调用前自行抽帧、下载原图、读取文件的时间不计入此期限。
 
-每次调用由官方 SDK 的 `ocr()` 提交一个远端任务并等待结果，轮询间隔由 SDK 控制；不自动重试，也不提供缓存或批量入口。超时或取消只结束本地等待，不代表远端任务已取消；调用方再次调用会提交新任务。最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用在库内排队，排队时间计入 `timeout`；调用方仍需控制整体调用频率，避免大量调用在队列中等到超时，批量调用的限流方式和并发取值见第 8 节。
+线上模式由官方 SDK 的 `ocr()` 提交一个远端任务并等待结果，轮询间隔由 SDK 控制；自部署模式向 `/ocr` 发送一次请求并直接解析响应。两种模式都不自动重试，也不提供缓存或批量入口。超时或取消只结束本地等待，线上远端任务可能继续运行。线上模式最大并发为 Token 数 × `PADDLEOCR_CONCURRENCY_PER_TOKEN`，超出的调用在库内排队；自部署模式不使用 Token 队列，调用方应根据服务容量控制并发。
 
-本库会在系统临时目录写入裁剪后的 PNG 供 SDK 上传，调用结束后删除；不保存输出文件、不打印日志。是否保存时间、原文及耗时由调用方决定。
+线上模式会在系统临时目录写入裁剪后的 PNG 供 SDK 上传，调用结束后删除；自部署模式直接发送内存中的 PNG，不写临时文件。本库不保存输出文件、不打印日志。是否保存时间、原文及耗时由调用方决定。
 
 ## 8. 批量调用
+
+本节的 Token 排队和历史实测仅适用于线上官方 API。自部署模式请按服务容量限制调用方的在途数量。
 
 库内排队的等待时间计入每个调用自己的 `timeout`，因此一次性投递整批会让尾部调用在队列里耗尽预算，批量越大失败比例越高。可承受的单批大小约为：
 
