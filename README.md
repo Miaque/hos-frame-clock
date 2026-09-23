@@ -44,7 +44,7 @@ asyncio.run(main())
 - 识别区域由 `crop_box=(left, top, right, bottom)` 指定，为帧宽高的比例，要求 `0 ≤ left < right ≤ 1`、`0 ≤ top < bottom ≤ 1`，否则抛 `ValueError`；默认 `(0.80, 0.0, 0.98, 0.12)`，即右上角横向 80%–98%、纵向 0%–12%。像素框左上向下取整，右下向上取整。1728×536 图片默认对应 `(1382, 0, 1694, 65)`，右下边界不包含在内。
 - 裁剪后转 RGB，使用 LANCZOS 将宽高各放大 3 倍，再编码为 PNG 上传，不二值化。312×65 的裁剪区域上传为 936×195。无需安装 PaddleOCR 本地模型。
 - 返回不可变 `FrameTime(timestamp: datetime, raw_text: str)`。`timestamp` 不含时区；`raw_text` 保留匹配处原文，但日期与时间紧邻时会补一个空格，OCR 把日期和时间分开时仍以换行连接。
-- 接受 `YYYY-MM-DD HH:MM:SS`，日期与时间之间的空白可省略（如 `2026-08-1505:20:17`，返回的 `raw_text` 为 `2026-08-15 05:20:17`），允许分隔符附近出现空白，校验日期合法性；不替换 `O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
+- 接受 `YYYY-MM-DD HH:MM:SS`；OCR 将日期与时间之间的空格识别为 `-`、`.`、`:` 或省略空格时，也按完整时间解析。时分之间的 `.` 可作为分隔符；保留匹配到的 OCR 原文，只有日期与时间紧邻时在 `raw_text` 中补一个空格。校验日期合法性；不猜测修正多出的数字、`O/0` 等字符，不补日期，不接受 ISO `T` 或毫秒格式。
 - 无有效时间，或出现多个不同的有效时间，返回 `None`。相同时间重复出现仍返回一个结果。
 - HTTP、网络、远端任务失败或响应格式异常抛 `OCRServiceError`；服务端限流（HTTP 429）抛其子类 `OCRRateLimitedError`，按 `OCRServiceError` 捕获仍然生效，库不因此自动重试。超时抛内置 `TimeoutError`。参数错误抛 `ValueError`，图片解码错误可抛 Pillow 的 `OSError`。
 - 10 秒覆盖图片准备、等待空闲 Token、提交任务、轮询和结果下载/解析；调用方可调整 `timeout`。每 0.5 秒轮询，任务只提交一次，不自动重试。
@@ -74,7 +74,7 @@ uv run python scripts/publish.py
 依赖项目通过 Nexus 安装固定版本（认证由本机或 CI 的包管理器配置提供；其他公共依赖仍由 uv 默认索引提供，如需统一走 Nexus，应改为管理员提供的 group 索引）：
 
 ```powershell
-uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.5.0"
+uv add --index http://172.18.6.206:8081/repository/pypi-hosted/simple/ "hos-frame-clock==0.5.1"
 ```
 
 每次发布先更新 `pyproject.toml` 的版本，并使用对应版本的构建产物路径。构建产物位于 `dist/`。本仓库不包含凭据。

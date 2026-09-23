@@ -265,6 +265,33 @@ class RecognitionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(texts=texts):
                 self.assertIsNone(await self.run_service(texts=texts))
 
+    async def test_real_camera_overlay_separator_recognitions(self):
+        for text, expected in (
+            ("2026-09-21-21:51:23", "2026-09-21T21:51:23"),
+            ("2026-09-22.09:42:54", "2026-09-22T09:42:54"),
+            ("2026-09-22:09:43:12", "2026-09-22T09:43:12"),
+            ("2026-09-22.09.44:25", "2026-09-22T09:44:25"),
+            ("2026-09-22-09:44:44", "2026-09-22T09:44:44"),
+            ("2026-09-22.09:45:02", "2026-09-22T09:45:02"),
+            ("2026-09-22-17:04:40", "2026-09-22T17:04:40"),
+            ("2026-09-22-17:04:41", "2026-09-22T17:04:41"),
+        ):
+            with self.subTest(text=text):
+                result = await self.run_service(texts=[text])
+                self.assertIsNotNone(result)
+                self.assertEqual(result.timestamp.isoformat(), expected)
+                self.assertEqual(result.raw_text, text)
+        for text in (
+            "12026-09-2217:04:21",
+            "2026-09-22 17113-18",
+            "2026-02-30.09:42:54",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(await self.run_service(texts=[text]))
+        self.assertIsNone(
+            await self.run_service(texts=["2026-09-22.09:42:54", "2026-09-22-09:42:55"])
+        )
+
     async def test_split_text_whitespace_and_duplicate_time(self):
         result = await self.run_service(texts=["2026 - 09 - 14", "05 : 25 : 36"])
         self.assertEqual(result.timestamp, datetime(2026, 9, 14, 5, 25, 36))
